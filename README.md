@@ -1,4 +1,4 @@
-# SyncEmMail
+# SyncEmail (a.k.a. GMail to SQLite)
 
 A Python tool to efficiently sync Gmail email headers to a local SQLite database using OAuth 2.0 authentication. But before you go...
 
