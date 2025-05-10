@@ -61,7 +61,7 @@ This will display a list of all mailboxes you can access, which you can then use
 
 ## Database Schema
 
-The SQLite database contains two main tables:
+The SQLite database contains three main tables:
 
 1. `emails` - Stores email metadata:
    - `uid` - Email UID (primary key)
@@ -72,7 +72,21 @@ The SQLite database contains two main tables:
    - `msg_date` - Date in ISO format
    - `mailbox` - Source mailbox name (e.g., "INBOX", "Sent", etc.)
 
-2. `sync_status` - Tracks sync operations:
+2. `full_emails` - Stores complete email content with generated columns:
+   - `uid` - Email UID (primary key, matches `emails` table)
+   - `mailbox` - Mailbox name
+   - `raw_email` - Complete raw email content (BLOB)
+   - `fetched_at` - Timestamp when the email was fetched
+   - Generated columns (calculated automatically):
+     - `has_attachments` - Boolean indicating if the email has attachments
+     - `message_size_kb` - Size of the email in KB
+     - `is_html` - Boolean indicating if the email has HTML content
+     - `is_plain_text` - Boolean indicating if the email has plain text content
+     - `has_images` - Boolean indicating if the email has embedded images
+     - `in_reply_to` - Message ID this email is replying to
+     - `message_id` - Unique message ID
+
+3. `sync_status` - Tracks sync operations:
    - `id` - Sync operation ID
    - `last_uid` - Last processed UID
    - `start_time` - When sync started
@@ -151,6 +165,53 @@ SELECT
 FROM emails 
 GROUP BY mailbox 
 ORDER BY email_count DESC;
+```
+
+### New Queries Using Generated Columns
+
+#### Find Large Emails with Attachments
+
+```sql
+SELECT e.subject, f.message_size_kb, e.msg_date
+FROM emails e
+JOIN full_emails f ON e.uid = f.uid AND e.mailbox = f.mailbox
+WHERE f.has_attachments = 1
+ORDER BY f.message_size_kb DESC
+LIMIT 20;
+```
+
+#### Emails with Images
+
+```sql
+SELECT e.subject, e.msg_from, e.msg_date
+FROM emails e
+JOIN full_emails f ON e.uid = f.uid AND e.mailbox = f.mailbox
+WHERE f.has_images = 1
+ORDER BY e.msg_date DESC
+LIMIT 50;
+```
+
+#### Find Message Threads
+
+```sql
+-- Find all emails in a thread using message_id and in_reply_to
+WITH RECURSIVE thread(uid, mailbox, message_id, level) AS (
+    -- Start with a specific message ID
+    SELECT uid, mailbox, message_id, 0
+    FROM full_emails
+    WHERE message_id = '<specific-message-id@example.com>'
+    
+    UNION ALL
+    
+    -- Find all replies
+    SELECT f.uid, f.mailbox, f.message_id, t.level + 1
+    FROM full_emails f
+    JOIN thread t ON f.in_reply_to = t.message_id
+)
+SELECT e.subject, e.msg_from, e.msg_date, t.level
+FROM thread t
+JOIN emails e ON t.uid = e.uid AND t.mailbox = e.mailbox
+ORDER BY e.msg_date;
 ```
 
 ## How It Works

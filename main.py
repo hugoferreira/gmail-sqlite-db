@@ -299,15 +299,145 @@ async def setup_schema(db):
             message TEXT
         )
     ''')
-    # Create a table to store full emails
-    await db.execute('''
-        CREATE TABLE IF NOT EXISTS full_emails (
-            uid TEXT PRIMARY KEY,
-            mailbox TEXT,
-            raw_email BLOB,
-            fetched_at TEXT
-        )
-    ''')
+    
+    # Check if full_emails table needs to be migrated
+    need_migration = False
+    table_exists = False
+    
+    async with db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='full_emails'") as cursor:
+        row = await cursor.fetchone()
+        if row:
+            table_exists = True
+            
+            # Check if it has the generated columns
+            async with db.execute("PRAGMA table_xinfo(full_emails)") as cursor:
+                columns = await cursor.fetchall()
+                # Check if has_attachments column exists and is a generated column
+                has_generated_columns = False
+                for col in columns:
+                    if col[1] == 'has_attachments' and col[6] > 0:  # col[6] > 0 means it's a generated column
+                        has_generated_columns = True
+                        break
+                
+                if not has_generated_columns:
+                    need_migration = True
+                    print("Migrating full_emails table to add generated columns...")
+    
+    if need_migration and table_exists:
+        # Create new table with generated columns
+        await db.execute('''
+            CREATE TABLE full_emails_new (
+                uid TEXT PRIMARY KEY,
+                mailbox TEXT,
+                raw_email BLOB,
+                fetched_at TEXT,
+                has_attachments BOOLEAN GENERATED ALWAYS AS (
+                    instr(raw_email, 'Content-Disposition: attachment') > 0 
+                    OR instr(raw_email, 'Content-Type: image/') > 0
+                    OR instr(raw_email, 'Content-Type: application/') > 0
+                    OR instr(raw_email, 'Content-Type: audio/') > 0
+                    OR instr(raw_email, 'Content-Type: video/') > 0
+                    OR (instr(raw_email, 'Content-Disposition: inline') > 0 AND instr(raw_email, 'filename=') > 0)
+                ) VIRTUAL,
+                message_size_kb INTEGER GENERATED ALWAYS AS (
+                    length(raw_email) / 1024
+                ) VIRTUAL,
+                is_html BOOLEAN GENERATED ALWAYS AS (
+                    instr(raw_email, 'Content-Type: text/html') > 0
+                ) VIRTUAL,
+                is_plain_text BOOLEAN GENERATED ALWAYS AS (
+                    instr(raw_email, 'Content-Type: text/plain') > 0
+                ) VIRTUAL,
+                has_images BOOLEAN GENERATED ALWAYS AS (
+                    instr(raw_email, 'Content-Type: image/') > 0
+                ) VIRTUAL,
+                in_reply_to TEXT GENERATED ALWAYS AS (
+                    CASE 
+                        WHEN instr(raw_email, 'In-Reply-To: ') > 0 
+                        THEN substr(
+                            raw_email,
+                            instr(raw_email, 'In-Reply-To: ') + 13,
+                            instr(substr(raw_email, instr(raw_email, 'In-Reply-To: ') + 13), CHAR(10)) - 1
+                        )
+                        ELSE NULL
+                    END
+                ) VIRTUAL,
+                message_id TEXT GENERATED ALWAYS AS (
+                    CASE 
+                        WHEN instr(raw_email, 'Message-ID: ') > 0 
+                        THEN substr(
+                            raw_email,
+                            instr(raw_email, 'Message-ID: ') + 12,
+                            instr(substr(raw_email, instr(raw_email, 'Message-ID: ') + 12), CHAR(10)) - 1
+                        )
+                        ELSE NULL
+                    END
+                ) VIRTUAL
+            )
+        ''')
+        
+        # Copy data from old table to new table
+        print("Copying email data to new table with generated columns...")
+        await db.execute("INSERT INTO full_emails_new (uid, mailbox, raw_email, fetched_at) SELECT uid, mailbox, raw_email, fetched_at FROM full_emails")
+        
+        # Drop old table and rename new one
+        await db.execute("DROP TABLE full_emails")
+        await db.execute("ALTER TABLE full_emails_new RENAME TO full_emails")
+        
+        print("Migration complete!")
+    elif not table_exists:
+        # Create table with generated columns
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS full_emails (
+                uid TEXT PRIMARY KEY,
+                mailbox TEXT,
+                raw_email BLOB,
+                fetched_at TEXT,
+                has_attachments BOOLEAN GENERATED ALWAYS AS (
+                    instr(raw_email, 'Content-Disposition: attachment') > 0 
+                    OR instr(raw_email, 'Content-Type: image/') > 0
+                    OR instr(raw_email, 'Content-Type: application/') > 0
+                    OR instr(raw_email, 'Content-Type: audio/') > 0
+                    OR instr(raw_email, 'Content-Type: video/') > 0
+                    OR (instr(raw_email, 'Content-Disposition: inline') > 0 AND instr(raw_email, 'filename=') > 0)
+                ) VIRTUAL,
+                message_size_kb INTEGER GENERATED ALWAYS AS (
+                    length(raw_email) / 1024
+                ) VIRTUAL,
+                is_html BOOLEAN GENERATED ALWAYS AS (
+                    instr(raw_email, 'Content-Type: text/html') > 0
+                ) VIRTUAL,
+                is_plain_text BOOLEAN GENERATED ALWAYS AS (
+                    instr(raw_email, 'Content-Type: text/plain') > 0
+                ) VIRTUAL,
+                has_images BOOLEAN GENERATED ALWAYS AS (
+                    instr(raw_email, 'Content-Type: image/') > 0
+                ) VIRTUAL,
+                in_reply_to TEXT GENERATED ALWAYS AS (
+                    CASE 
+                        WHEN instr(raw_email, 'In-Reply-To: ') > 0 
+                        THEN substr(
+                            raw_email,
+                            instr(raw_email, 'In-Reply-To: ') + 13,
+                            instr(substr(raw_email, instr(raw_email, 'In-Reply-To: ') + 13), CHAR(10)) - 1
+                        )
+                        ELSE NULL
+                    END
+                ) VIRTUAL,
+                message_id TEXT GENERATED ALWAYS AS (
+                    CASE 
+                        WHEN instr(raw_email, 'Message-ID: ') > 0 
+                        THEN substr(
+                            raw_email,
+                            instr(raw_email, 'Message-ID: ') + 12,
+                            instr(substr(raw_email, instr(raw_email, 'Message-ID: ') + 12), CHAR(10)) - 1
+                        )
+                        ELSE NULL
+                    END
+                ) VIRTUAL
+            )
+        ''')
+    
     await db.commit()
 
 # Create a non-async function to authenticate with IMAP using XOAUTH2
