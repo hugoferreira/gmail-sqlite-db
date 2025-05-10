@@ -8,3 +8,14 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Ignore all local databases
+*.sqlite3*
+*.db
+
+# Ignore credentials
+creds.json
+token.json
+
+# Ignore checkpoint files
+checkpoint*.json
