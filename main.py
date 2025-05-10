@@ -20,7 +20,9 @@ from tqdm import tqdm
 # OAuth2 setup
 SCOPES = ['https://mail.google.com/']
 TOKEN_PATH = 'token.json'
-CHECKPOINT_PATH = 'checkpoint.json'  # To track sync state
+CHECKPOINT_PATH = 'checkpoint.json'  # Default (legacy support)
+CHECKPOINT_HEADERS_PATH = 'checkpoint_headers.json'
+CHECKPOINT_FULL_PATH = 'checkpoint_full.json'
 CHUNK_SIZE = 250  # Reduced for more reliable processing and frequent commits
 EMAILS_PER_COMMIT = 20  # Commit after processing this many emails
 DEBUG = False   # Enable debug mode - set to False by default for full processing
@@ -297,7 +299,15 @@ async def setup_schema(db):
             message TEXT
         )
     ''')
-            
+    # Create a table to store full emails
+    await db.execute('''
+        CREATE TABLE IF NOT EXISTS full_emails (
+            uid TEXT PRIMARY KEY,
+            mailbox TEXT,
+            raw_email BLOB,
+            fetched_at TEXT
+        )
+    ''')
     await db.commit()
 
 # Create a non-async function to authenticate with IMAP using XOAUTH2
@@ -355,26 +365,234 @@ async def list_mailboxes(host, user, creds):
         except Exception as e:
             print(f"Error during logout: {e}")
 
-async def fetch_headers(db, host, user, creds, mailbox='INBOX'):
-    # Initialize the checkpoint manager
-    checkpoint = CheckpointManager()
-    
-    # Check if a previous run was interrupted
-    if checkpoint.was_interrupted():
-        print(f"A previous sync was interrupted. Resuming from last checkpoint.")
+class EmailSyncer:
+    def __init__(self, db, host, user, creds, mailbox, mode, fetch_fn):
+        self.db = db
+        self.host = host
+        self.user = user
+        self.creds = creds
+        self.mailbox = mailbox
+        self.mode = mode
+        self.fetch_fn = fetch_fn
+        # Use mode-specific checkpoint file
+        checkpoint_path = CHECKPOINT_HEADERS_PATH if mode == 'headers' else CHECKPOINT_FULL_PATH
+        self.checkpoint = CheckpointManager(checkpoint_path)
+        self.loop = asyncio.get_event_loop()
+        self.imap = None
+        self.last_status_id = None
+        self.failed_uids = self.checkpoint.get_failed_uids()
+        self.commit_interval = 1
+        self.emails_since_commit = 0
+        self.pbar = None
+
+    async def connect(self):
+        print(f"Connecting to {self.host} as {self.user} for {self.mode} sync...")
+        self.imap = await self.loop.run_in_executor(
+            None, lambda: imap_oauth2_login(self.host, self.user, self.creds.token)
+        )
+        print(f"Connection established successfully")
+
+    async def start_sync(self, start_message):
+        self.checkpoint.mark_start(self.mailbox)
+        await self.db.execute('''
+            INSERT INTO sync_status (start_time, status, message)
+            VALUES (?, 'STARTED', ?)
+        ''', (datetime.datetime.now().isoformat(), start_message))
+        async with self.db.execute('SELECT last_insert_rowid()') as cursor:
+            row = await cursor.fetchone()
+            self.last_status_id = row[0] if row else None
+
+    async def finish_sync(self, status, message):
+        await self.db.execute(f"UPDATE sync_status SET end_time = ?, status = ?, message = ? WHERE id = ?", 
+                          (datetime.datetime.now().isoformat(), status, message, self.last_status_id))
+        await self.db.commit()
+        self.checkpoint.mark_complete()
+
+    async def run(self, uids_to_fetch, total_count, fetch_mode_desc):
+        processed_count = 0
+        skipped_count = 0
+        saved_count = 0
+        self.emails_since_commit = 0
         
-    # Run the synchronous IMAP authentication in a thread pool
+        if DEBUG:
+            # Print the first few UIDs we'll be processing
+            sample_uids = uids_to_fetch[:min(10, len(uids_to_fetch))]
+            print(f"[DEBUG] First {len(sample_uids)} UIDs to process: {sample_uids}")
+            print(f"[DEBUG] Total UIDs to process: {total_count}")
+            if self.failed_uids:
+                sample_failed = self.failed_uids[:min(10, len(self.failed_uids))]
+                print(f"[DEBUG] First {len(sample_failed)} failed UIDs: {sample_failed}")
+        
+        self.pbar = tqdm(total=total_count, desc=f'Fetching {fetch_mode_desc}')
+        prev_mailbox = None
+        try:
+            for chunk_idx, i in enumerate(range(0, len(uids_to_fetch), CHUNK_SIZE)):
+                chunk = uids_to_fetch[i:i + CHUNK_SIZE]
+                if not chunk:
+                    continue
+                for uid, mbox in chunk:
+                    is_retry = uid in self.failed_uids
+                    try:
+                        # Always select the correct mailbox before fetching
+                        if prev_mailbox != mbox:
+                            status, _ = await self.loop.run_in_executor(None, lambda: self.imap.select(mbox, readonly=True))
+                            if status != 'OK':
+                                print(f"Failed to select mailbox {mbox}: {status}")
+                                self.checkpoint.add_failed_uid(uid)
+                                skipped_count += 1
+                                self.pbar.update(1)
+                                prev_mailbox = mbox
+                                continue
+                            prev_mailbox = mbox
+                        # Call the fetch function (header or full)
+                        result = await self.fetch_fn(self, uid, mbox)
+                        if result == 'fail':
+                            skipped_count += 1
+                        elif result == 'saved':
+                            saved_count += 1
+                            processed_count += 1
+                        self.pbar.update(1)
+                        self.emails_since_commit += 1
+                        if self.emails_since_commit >= EMAILS_PER_COMMIT:
+                            self.checkpoint.save_state()
+                            try:
+                                await self.db.commit()
+                                try:
+                                    await self.db.execute("BEGIN TRANSACTION")
+                                except Exception as e:
+                                    debug_print(f"Transaction already started: {e}")
+                            except Exception as commit_err:
+                                print(f"Error committing transaction: {commit_err}")
+                            self.emails_since_commit = 0
+                    except Exception as e:
+                        debug_print(f"Error processing UID {uid}: {e}")
+                        self.checkpoint.add_failed_uid(uid)
+                        skipped_count += 1
+                        self.pbar.update(1)
+                if chunk_idx % self.commit_interval == 0:
+                    self.checkpoint.save_state()
+                    try:
+                        await self.db.commit()
+                        try:
+                            await self.db.execute("BEGIN TRANSACTION")
+                        except Exception as e:
+                            debug_print(f"Transaction already started: {e}")
+                    except Exception as commit_err:
+                        print(f"Error committing transaction: {commit_err}")
+            await self.db.commit()
+            await self.finish_sync('COMPLETED', f'Successfully processed {saved_count} {fetch_mode_desc}')
+        except KeyboardInterrupt:
+            print("\nOperation interrupted by user. Saving progress...")
+            try:
+                await self.db.commit()
+                await self.finish_sync('INTERRUPTED', 'Interrupted by user')
+                self.checkpoint.save_state()
+                print(f"Progress saved. Last processed UID: {self.checkpoint.get_last_uid()}")
+                print(f"Failed UIDs count: {len(self.checkpoint.get_failed_uids())}")
+            except Exception as e:
+                print(f"Error saving progress: {e}")
+            raise
+        except Exception as e:
+            print(f"\nUnexpected error: {e}")
+            try:
+                await self.db.commit()
+                await self.finish_sync('ERROR', str(e)[:200])
+                self.checkpoint.save_state()
+                print(f"Partial progress saved. Last processed UID: {self.checkpoint.get_last_uid()}")
+                print(f"Failed UIDs count: {len(self.checkpoint.get_failed_uids())}")
+            except Exception as commit_err:
+                print(f"Error saving progress: {commit_err}")
+            raise
+        finally:
+            self.pbar.n = processed_count
+            self.pbar.refresh()
+            self.pbar.close()
+            print(f"Successfully processed {processed_count} messages")
+            print(f"Saved {saved_count} {fetch_mode_desc} to database")
+            print(f"Skipped {skipped_count} messages")
+        return processed_count, saved_count, skipped_count
+
+async def fetch_headers_syncer(syncer, uid, mailbox):
+    # Fetch headers for a single UID
+    status, data = await syncer.loop.run_in_executor(
+        None,
+        lambda: syncer.imap.uid('FETCH', uid, '(BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE)])')
+    )
+    if status != 'OK':
+        debug_print(f"Failed to fetch headers for UID {uid}: {status}")
+        syncer.checkpoint.add_failed_uid(uid)
+        return 'fail'
+    header_data = None
+    for item in data:
+        if isinstance(item, tuple) and len(item) > 1:
+            header_data = item[1]
+            break
+    if not header_data:
+        debug_print(f"No header data found for UID {uid}")
+        syncer.checkpoint.add_failed_uid(uid)
+        return 'fail'
+    msg = email.message_from_bytes(header_data if isinstance(header_data, bytes) else header_data.encode('utf-8'))
+    date_str = decode_field(msg.get('Date', ''))
+    iso_date = parse_email_date(date_str)
+    await syncer.db.execute(
+        'INSERT OR REPLACE INTO emails(uid, msg_from, msg_to, msg_cc, subject, msg_date, mailbox) VALUES(?,?,?,?,?,?,?)',
+        (
+            uid,
+            decode_field(msg.get('From', '')),
+            decode_field(msg.get('To', '')),
+            decode_field(msg.get('Cc', '')),
+            decode_field(msg.get('Subject', '')),
+            iso_date,
+            mailbox
+        )
+    )
+    syncer.checkpoint.update_progress(uid)
+    if uid in syncer.failed_uids:
+        syncer.checkpoint.clear_failed_uid(uid)
+    return 'saved'
+
+async def fetch_full_email_syncer(syncer, uid, mailbox):
+    debug_print(f"Fetching full email for UID {uid} in mailbox {mailbox}...")
+    status, data = await syncer.loop.run_in_executor(
+        None,
+        lambda: syncer.imap.uid('FETCH', uid, '(BODY.PEEK[])')
+    )
+    if status != 'OK' or not data:
+        print(f"[ERROR] Failed to fetch UID {uid}: status={status}, data_len={len(data) if data else 0}")
+        syncer.checkpoint.add_failed_uid(uid)
+        return 'fail'
+    debug_print(f"Received data for UID {uid}, processing...")
+    raw_email = None
+    for item in data:
+        if isinstance(item, tuple) and len(item) > 1:
+            raw_email = item[1]
+            break
+    if not raw_email:
+        if syncer.pbar.n < 10:
+            debug_print(f"[DEBUG] No raw email data found for UID {uid} in mailbox {mailbox}. Data: {data}")
+        syncer.checkpoint.add_failed_uid(uid)
+        return 'fail'
+    await syncer.db.execute(
+        'INSERT OR REPLACE INTO full_emails(uid, mailbox, raw_email, fetched_at) VALUES(?,?,?,?)',
+        (uid, mailbox, raw_email, datetime.datetime.now().isoformat())
+    )
+    if syncer.pbar.n < 10:
+        print(f"[DEBUG] Successfully saved full email for UID {uid} in mailbox {mailbox}.")
+    syncer.checkpoint.update_progress(uid)
+    if uid in syncer.failed_uids:
+        syncer.checkpoint.clear_failed_uid(uid)
+    return 'saved'
+
+# Refactored fetch_headers and fetch_full_emails to use EmailSyncer and the above fetch functions
+async def fetch_headers(db, host, user, creds, mailbox='INBOX'):
+    checkpoint = CheckpointManager()
     loop = asyncio.get_event_loop()
     imap = await loop.run_in_executor(
         None, 
         lambda: imap_oauth2_login(host, user, creds.token)
     )
-    
     try:
-        # Mark the start of the sync operation
         checkpoint.mark_start(mailbox)
-        
-        # Record sync start
         await db.execute('''
             INSERT INTO sync_status (start_time, status, message)
             VALUES (?, 'STARTED', 'Starting sync operation')
@@ -382,63 +600,33 @@ async def fetch_headers(db, host, user, creds, mailbox='INBOX'):
         async with db.execute('SELECT last_insert_rowid()') as cursor:
             row = await cursor.fetchone()
             last_status_id = row[0] if row else None
-        
-        # Start transaction for better SQLite performance during heavy inserts
-        try:
-            await db.execute("BEGIN TRANSACTION")
-        except Exception as e:
-            debug_print(f"Transaction already started: {e}")
-            # If a transaction is already active, we can continue
-        
-        # Select mailbox
         status, data = await loop.run_in_executor(None, lambda: imap.select(mailbox, readonly=True))
         if status != 'OK':
             sys.exit(f"Failed to select mailbox: {status}")
-            
-        # Determine resume point - use the max of:
-        # 1. Last successfully processed UID from checkpoint
-        # 2. Last UID in database (fallback)
         last_uid_checkpoint = checkpoint.get_last_uid()
-        
         async with db.execute("SELECT MAX(CAST(uid AS INTEGER)) FROM emails") as cursor:
             row = await cursor.fetchone()
         last_uid_db = int(row[0]) if row and row[0] else 0
-        
-        # Use the lower of the two to be safe - we'd rather re-process some emails
-        # than skip any if the database is ahead of the checkpoint
         if last_uid_checkpoint > 0 and last_uid_db > 0:
             last_uid = min(last_uid_checkpoint, last_uid_db)
         else:
             last_uid = max(last_uid_checkpoint, last_uid_db)
-            
         print(f"Resuming from UID > {last_uid}")
-        
-        # Check for failed UIDs from previous runs
         failed_uids = checkpoint.get_failed_uids()
         if failed_uids:
             print(f"Found {len(failed_uids)} failed UIDs from previous runs. Will retry these.")
-        
-        # Fetch all UIDs
         status, data = await loop.run_in_executor(None, lambda: imap.uid('SEARCH', None, 'ALL'))
         if status != 'OK':
             sys.exit(f"Failed to search mailbox: {status}")
-            
         uid_list = data[0].decode().split() if isinstance(data[0], bytes) else data[0].split()
-        all_uids = list(map(int, uid_list))
-        
-        # Get new UIDs not yet processed and add any previously failed UIDs
-        new_uids = [uid for uid in all_uids if uid > last_uid]
+        all_uids = list(map(str, uid_list))
+        new_uids = [uid for uid in all_uids if int(uid) > last_uid]
         if failed_uids:
-            # Convert failed UIDs to integers for sorting
-            failed_uids_int = [int(uid) for uid in failed_uids]
-            # Add them to new_uids if they exist in all_uids (still on server)
+            failed_uids_int = [str(uid) for uid in failed_uids]
             retry_uids = [uid for uid in failed_uids_int if uid in all_uids]
-            # Add any retry UIDs that are not already in new_uids (to avoid duplicates)
             retry_uids = [uid for uid in retry_uids if uid not in new_uids]
             new_uids.extend(retry_uids)
-            # Sort to process in UID order
-            new_uids.sort()
-            
+            new_uids.sort(key=int)
         if not new_uids:
             print('No new messages to fetch.')
             checkpoint.mark_complete()
@@ -446,289 +634,103 @@ async def fetch_headers(db, host, user, creds, mailbox='INBOX'):
                           (datetime.datetime.now().isoformat(), 'COMPLETED', 'No new messages to fetch', last_status_id))
             await db.commit()
             return
-        
         total_count = len(new_uids)
-        print(f"Found {total_count} new emails to fetch")
-        
-        # Process in chunks with progress bar
-        processed_count = 0
-        skipped_count = 0
-        saved_count = 0
-        emails_since_commit = 0
-        commit_interval = 1  # Commit after every chunk for safety
-        pbar = tqdm(total=total_count, desc='Fetching headers')
-        
-        try:
-            # Process emails in chunks
-            for chunk_idx, i in enumerate(range(0, len(new_uids), CHUNK_SIZE)):
-                chunk = new_uids[i:i + CHUNK_SIZE]
-                if not chunk:
-                    continue
-                    
-                range_str = f"{chunk[0]}:{chunk[-1]}"
-                debug_print(f"\nProcessing range: {range_str}")
-                
-                try:
-                    # Manually fetch UIDs first
-                    status, data = await loop.run_in_executor(
-                        None, 
-                        lambda: imap.uid('FETCH', range_str, '(UID)')
-                    )
-                    
-                    if status != 'OK':
-                        print(f"Failed to fetch UIDs for range {range_str}: {status}")
-                        # Mark these UIDs as failed in the checkpoint
-                        for uid in chunk:
-                            checkpoint.add_failed_uid(str(uid))
-                        pbar.update(len(chunk))
-                        skipped_count += len(chunk)
-                        continue
-                    
-                    # Extract the actual UIDs from the response
-                    actual_uids = []
-                    for item in data:
-                        if isinstance(item, bytes):
-                            uid = extract_uid(item)
-                            if uid:
-                                actual_uids.append(uid)
-                    
-                    debug_print(f"Found {len(actual_uids)} actual UIDs in range")
-                    
-                    if not actual_uids:
-                        print(f"No valid UIDs found in range {range_str}")
-                        pbar.update(len(chunk))
-                        skipped_count += len(chunk)
-                        continue
-                    
-                    # Now fetch headers for just the first 10 UIDs in debug mode
-                    test_count = min(50, len(actual_uids)) if DEBUG else len(actual_uids)
-                    test_uids = actual_uids[:test_count]
-                    
-                    debug_print(f"Fetching headers for {test_count} test UIDs")
-                    
-                    for uid in test_uids:
-                        # Check if this was a previously failed UID
-                        is_retry = uid in failed_uids
-                        
-                        # Fetch headers for a single UID
-                        status, data = await loop.run_in_executor(
-                            None, 
-                            lambda: imap.uid('FETCH', uid, '(BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE)])')
-                        )
-                        
-                        if status != 'OK':
-                            debug_print(f"Failed to fetch headers for UID {uid}: {status}")
-                            # Mark this UID as failed in the checkpoint
-                            checkpoint.add_failed_uid(uid)
-                            continue
-                        
-                        debug_print(f"Response for UID {uid}: {len(data)} items")
-                        
-                        try:
-                            # Find the header data in the response
-                            header_data = None
-                            for item in data:
-                                if isinstance(item, tuple) and len(item) > 1:
-                                    header_data = item[1]
-                                    break
-                            
-                            if not header_data:
-                                debug_print(f"No header data found for UID {uid}")
-                                # Mark this UID as failed in the checkpoint
-                                checkpoint.add_failed_uid(uid)
-                                continue
-                                
-                            # Process the header data
-                            msg = email.message_from_bytes(header_data if isinstance(header_data, bytes) else header_data.encode('utf-8'))
-                            
-                            # Parse the date into ISO format
-                            date_str = decode_field(msg.get('Date', ''))
-                            iso_date = parse_email_date(date_str)
-                            
-                            # Insert this email
-                            await db.execute(
-                                'INSERT OR REPLACE INTO emails(uid, msg_from, msg_to, msg_cc, subject, msg_date, mailbox) VALUES(?,?,?,?,?,?,?)',
-                                (
-                                    uid,
-                                    decode_field(msg.get('From', '')),
-                                    decode_field(msg.get('To', '')),
-                                    decode_field(msg.get('Cc', '')),
-                                    decode_field(msg.get('Subject', '')),
-                                    iso_date,
-                                    mailbox
-                                )
-                            )
-                            saved_count += 1
-                            processed_count += 1
-                            
-                            # Update progress bar
-                            pbar.update(1)
-                            
-                            # Update checkpoint - mark as processed
-                            checkpoint.update_progress(uid)
-                            
-                            # If this was a retry of a failed UID, clear it from the failed list
-                            if is_retry:
-                                checkpoint.clear_failed_uid(uid)
-                                
-                            # Commit after processing a certain number of emails
-                            emails_since_commit += 1
-                            if emails_since_commit >= EMAILS_PER_COMMIT:
-                                debug_print(f"Committing after {emails_since_commit} emails")
-                                # Save state before committing
-                                checkpoint.save_state()
-                                
-                                try:
-                                    await db.commit()
-                                    
-                                    # Start a new transaction
-                                    try:
-                                        await db.execute("BEGIN TRANSACTION")
-                                    except Exception as e:
-                                        debug_print(f"Transaction already started: {e}")
-                                except Exception as commit_err:
-                                    print(f"Error committing transaction: {commit_err}")
-                                
-                                emails_since_commit = 0
-                                
-                        except Exception as e:
-                            debug_print(f"Error processing UID {uid}: {e}")
-                            # Mark this UID as failed in the checkpoint
-                            checkpoint.add_failed_uid(uid)
-                    
-                    # If in debug mode, we only process the first chunk
-                    if DEBUG:
-                        # Commit what we have
-                        await db.commit()
-                        debug_print(f"Debug mode: processed {saved_count} emails in first chunk")
-                        break
-                    
-                    # Commit periodically
-                    if chunk_idx % commit_interval == 0:
-                        # Save state of transaction before committing
-                        checkpoint.save_state()
-                        
-                        # Try to commit what we have
-                        try:
-                            await db.commit()
-                            
-                            # Start a new transaction
-                            try:
-                                await db.execute("BEGIN TRANSACTION")
-                            except Exception as e:
-                                debug_print(f"Transaction already started: {e}")
-                        except Exception as commit_err:
-                            print(f"Error committing transaction: {commit_err}")
-                        
-                        debug_print(f"Committed after chunk {chunk_idx}, saved {saved_count} emails so far")
-                
-                except Exception as e:
-                    print(f"Error fetching range {range_str}: {e}")
-                    
-                    # Mark all UIDs in this chunk as failed
-                    for uid in actual_uids:
-                        checkpoint.add_failed_uid(uid)
-                        
-                    pbar.update(len(chunk))
-                    skipped_count += len(chunk)
-                    
-                    # Try to commit what we have
-                    try:
-                        await db.commit()
-                    except Exception as commit_err:
-                        print(f"Error committing transaction: {commit_err}")
-                
-                # Small delay to avoid hammering the server
-                await asyncio.sleep(0.1)
-            
-            # Final commit
-            await db.commit()
-            
-            # Update the sync status
-            await db.execute(f"UPDATE sync_status SET end_time = ?, status = ?, message = ?, last_uid = ? WHERE id = ?", 
-                          (datetime.datetime.now().isoformat(), 'COMPLETED', f'Successfully processed {saved_count} emails', 
-                           checkpoint.get_last_uid(), last_status_id))
-            await db.commit()
-            
-            # Mark the sync as complete in the checkpoint
-            checkpoint.mark_complete()
-            
-        except KeyboardInterrupt:
-            print("\nOperation interrupted by user. Saving progress...")
-            try:
-                await db.commit()
-                # Update the sync status
-                await db.execute(f"UPDATE sync_status SET end_time = ?, status = ?, message = ?, last_uid = ? WHERE id = ?", 
-                             (datetime.datetime.now().isoformat(), 'INTERRUPTED', 'Interrupted by user', 
-                              checkpoint.get_last_uid(), last_status_id))
-                await db.commit()
-                
-                # Save the checkpoint state
-                checkpoint.save_state()
-                
-                print(f"Progress saved. Last processed UID: {checkpoint.get_last_uid()}")
-                print(f"Failed UIDs count: {len(checkpoint.get_failed_uids())}")
-            except Exception as e:
-                print(f"Error saving progress: {e}")
-            raise
-            
-        except Exception as e:
-            print(f"\nUnexpected error: {e}")
-            try:
-                await db.commit()
-                # Update the sync status
-                await db.execute(f"UPDATE sync_status SET end_time = ?, status = ?, message = ?, last_uid = ? WHERE id = ?", 
-                             (datetime.datetime.now().isoformat(), 'ERROR', str(e)[:200], 
-                              checkpoint.get_last_uid(), last_status_id))
-                await db.commit()
-                
-                # Save the checkpoint state
-                checkpoint.save_state()
-                
-                print(f"Partial progress saved. Last processed UID: {checkpoint.get_last_uid()}")
-                print(f"Failed UIDs count: {len(checkpoint.get_failed_uids())}")
-            except Exception as commit_err:
-                print(f"Error saving progress: {commit_err}")
-            raise
-            
-        finally:
-            pbar.n = processed_count
-            pbar.refresh()
-            pbar.close()
-            
-            print(f"Successfully processed {processed_count} messages")
-            print(f"Saved {saved_count} messages to database")
-            print(f"Skipped {skipped_count} messages")
-            
+        await EmailSyncer(db, host, user, creds, mailbox, 'headers', fetch_headers_syncer).run([(uid, mailbox) for uid in new_uids], total_count, 'headers')
     except Exception as e:
         print(f"Error in fetch_headers: {e}")
         try:
             await db.commit()
-            # Update the sync status
             await db.execute(f"UPDATE sync_status SET end_time = ?, status = ?, message = ? WHERE id = ?", 
                          (datetime.datetime.now().isoformat(), 'ERROR', str(e)[:200], last_status_id))
             await db.commit()
         except Exception as commit_err:
             print(f"Error committing to database: {commit_err}")
         raise
-        
     finally:
         try:
-            # Try to logout gracefully
-            try:
-                await loop.run_in_executor(None, lambda: imap.logout())
-            except imaplib.IMAP4.error as e:
-                # These are expected IMAP errors that can be safely ignored during logout
-                print(f"Normal IMAP error during logout: {e}")
-            except ConnectionError as e:
-                # Connection might be closed already
-                print(f"Connection error during logout (can be ignored): {e}")
-            except Exception as e:
-                # Other unexpected errors
-                print(f"Error during logout: {e}")
+            await loop.run_in_executor(None, lambda: imap.logout())
         except Exception as e:
-            # Catch-all for any other unexpected errors
-            print(f"Unexpected error during logout: {e}")
+            print(f"Error during logout: {e}")
+
+async def fetch_full_emails(db, host, user, creds, mailbox='INBOX'):
+    checkpoint = CheckpointManager(CHECKPOINT_FULL_PATH)
+    loop = asyncio.get_event_loop()
+    imap = await loop.run_in_executor(
+        None,
+        lambda: imap_oauth2_login(host, user, creds.token)
+    )
+    try:
+        checkpoint.mark_start(mailbox)
+        await db.execute('''
+            INSERT INTO sync_status (start_time, status, message)
+            VALUES (?, 'STARTED', 'Starting full email sync')
+        ''', (datetime.datetime.now().isoformat(),))
+        async with db.execute('SELECT last_insert_rowid()') as cursor:
+            row = await cursor.fetchone()
+            last_status_id = row[0] if row else None
+        async with db.execute('SELECT uid, mailbox FROM emails WHERE mailbox = ?', (mailbox,)) as cursor:
+            all_rows = await cursor.fetchall()
+        all_uids = [(str(row[0]), row[1]) for row in all_rows]
+        
+        print(f"Found {len(all_uids)} total emails in database for mailbox {mailbox}")
+        
+        async with db.execute('SELECT uid FROM full_emails WHERE mailbox = ?', (mailbox,)) as cursor:
+            fetched_rows = await cursor.fetchall()
+        fetched_uids = set(str(row[0]) for row in fetched_rows)
+        
+        print(f"Already fetched {len(fetched_uids)} full emails")
+        
+        failed_uids = checkpoint.get_failed_uids()
+        if failed_uids:
+            print(f"Found {len(failed_uids)} failed UIDs from previous full-email fetches. Will retry these.")
+            print(f"First 5 failed UIDs: {failed_uids[:5]}")
+        
+        uids_to_fetch = [(uid, mbox) for (uid, mbox) in all_uids if uid not in fetched_uids]
+        retry_uids = [(uid, mbox) for (uid, mbox) in all_uids if uid in failed_uids and uid not in fetched_uids]
+        print(f"UIDs needing full email fetch: {len(uids_to_fetch)}")
+        print(f"Failed UIDs to retry: {len(retry_uids)}")
+        
+        for item in retry_uids:
+            if item not in uids_to_fetch:
+                uids_to_fetch.append(item)
+        total_count = len(uids_to_fetch)
+        print(f"Total UIDs to fetch: {total_count}")
+        
+        if not uids_to_fetch:
+            checkpoint.mark_complete()
+            await db.execute(f"UPDATE sync_status SET end_time = ?, status = ?, message = ? WHERE id = ?", 
+                          (datetime.datetime.now().isoformat(), 'COMPLETED', 'No new full emails to fetch', last_status_id))
+            await db.commit()
+            return
+            
+        # Sample a few UIDs for debugging
+        if len(uids_to_fetch) > 0:
+            print(f"Sample UIDs to fetch (first 5): {uids_to_fetch[:5]}")
+        
+        # Limit number of UIDs to fetch for debugging if needed
+        if DEBUG and total_count > 100:
+            print(f"DEBUG mode: Limiting to first 100 UIDs for testing")
+            uids_to_fetch = uids_to_fetch[:100]
+            total_count = len(uids_to_fetch)
+
+        syncer = EmailSyncer(db, host, user, creds, mailbox, 'full', fetch_full_email_syncer)
+        await syncer.connect()
+        await syncer.run(uids_to_fetch, total_count, 'full emails')
+    except Exception as e:
+        print(f"Error in fetch_full_emails: {e}")
+        try:
+            await db.commit()
+            await db.execute(f"UPDATE sync_status SET end_time = ?, status = ?, message = ? WHERE id = ?", 
+                         (datetime.datetime.now().isoformat(), 'ERROR', str(e)[:200], last_status_id))
+            await db.commit()
+        except Exception as commit_err:
+            print(f"Error committing to database: {commit_err}")
+        raise
+    finally:
+        try:
+            await loop.run_in_executor(None, lambda: imap.logout())
+        except Exception as e:
+            print(f"Error during logout: {e}")
 
 async def main():
     parser = argparse.ArgumentParser(description='Fetch Gmail headers to SQLite using OAuth2')
@@ -739,6 +741,7 @@ async def main():
     parser.add_argument('--mailbox', default='INBOX', help='Mailbox name')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--list-mailboxes', action='store_true', help='List available mailboxes and exit')
+    parser.add_argument('--mode', choices=['headers', 'full'], default='headers', help='Execution mode: headers (default) or full (fetch full emails)')
     args = parser.parse_args()
     
     global DEBUG
@@ -753,7 +756,10 @@ async def main():
     
     async with aiosqlite.connect(args.db) as db:
         await setup_schema(db)
-        await fetch_headers(db, args.host, args.user, creds, args.mailbox)
+        if args.mode == 'headers':
+            await fetch_headers(db, args.host, args.user, creds, args.mailbox)
+        elif args.mode == 'full':
+            await fetch_full_emails(db, args.host, args.user, creds, args.mailbox)
     print('Done.')
 
 if __name__ == '__main__':
