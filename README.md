@@ -47,6 +47,17 @@ python main.py --db ./mail.sqlite3 --creds creds.json --user your.email@gmail.co
 - `--user`: Gmail address (required)
 - `--mailbox`: Mailbox name (default: `INBOX`)
 - `--debug`: Enable debug mode
+- `--list-mailboxes`: List available mailboxes and exit
+
+### Listing Available Mailboxes
+
+To see all available mailboxes in your email account, use the `--list-mailboxes` argument:
+
+```
+python main.py --creds creds.json --user your.email@gmail.com --list-mailboxes
+```
+
+This will display a list of all mailboxes you can access, which you can then use with the `--mailbox` argument to sync emails from a specific mailbox.
 
 ## Database Schema
 
@@ -59,6 +70,7 @@ The SQLite database contains two main tables:
    - `msg_cc` - CC recipients
    - `subject` - Email subject
    - `msg_date` - Date in ISO format
+   - `mailbox` - Source mailbox name (e.g., "INBOX", "Sent", etc.)
 
 2. `sync_status` - Tracks sync operations:
    - `id` - Sync operation ID
@@ -128,6 +140,17 @@ SELECT * FROM domain_senders LIMIT 20;
 SELECT * FROM emails 
 WHERE msg_date BETWEEN '2023-01-01' AND '2023-12-31' 
 ORDER BY msg_date DESC;
+```
+
+### Count Emails by Mailbox
+
+```sql
+SELECT 
+    mailbox, 
+    COUNT(*) as email_count 
+FROM emails 
+GROUP BY mailbox 
+ORDER BY email_count DESC;
 ```
 
 ## How It Works

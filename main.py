@@ -22,7 +22,6 @@ SCOPES = ['https://mail.google.com/']
 TOKEN_PATH = 'token.json'
 CHECKPOINT_PATH = 'checkpoint.json'  # To track sync state
 CHUNK_SIZE = 250  # Reduced for more reliable processing and frequent commits
-BATCH_SIZE = 100   # Number of rows to commit at once
 EMAILS_PER_COMMIT = 20  # Commit after processing this many emails
 DEBUG = False   # Enable debug mode - set to False by default for full processing
 
@@ -255,7 +254,8 @@ async def setup_schema(db):
                 msg_to TEXT,
                 msg_cc TEXT,
                 subject TEXT,
-                msg_date TEXT
+                msg_date TEXT,
+                mailbox TEXT
             )
         ''')
         # Add indexes
@@ -263,7 +263,23 @@ async def setup_schema(db):
         await db.execute('CREATE INDEX IF NOT EXISTS idx_to ON emails(msg_to)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_cc ON emails(msg_cc)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_date ON emails(msg_date)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_mailbox ON emails(mailbox)')
     else:
+        # Check if the table contains the mailbox column
+        has_mailbox_column = False
+        async with db.execute("PRAGMA table_info(emails)") as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                if row[1] == 'mailbox':
+                    has_mailbox_column = True
+                    break
+        
+        # Add the mailbox column if it doesn't exist
+        if not has_mailbox_column:
+            print("Adding 'mailbox' column to emails table...")
+            await db.execute('ALTER TABLE emails ADD COLUMN mailbox TEXT')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_mailbox ON emails(mailbox)')
+        
         # Check if we need to add the date index
         async with db.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_date'") as cursor:
             row = await cursor.fetchone()
@@ -296,6 +312,48 @@ def imap_oauth2_login(host, user, access_token):
     imap.authenticate('XOAUTH2', lambda x: auth_string)
     
     return imap
+
+async def list_mailboxes(host, user, creds):
+    """List all available mailboxes on the server"""
+    print(f"Connecting to {host} as {user}...")
+    
+    # Run the synchronous IMAP authentication in a thread pool
+    loop = asyncio.get_event_loop()
+    imap = await loop.run_in_executor(
+        None, 
+        lambda: imap_oauth2_login(host, user, creds.token)
+    )
+    
+    try:
+        print("Fetching mailboxes:")
+        status, mailboxes = await loop.run_in_executor(None, imap.list)
+        
+        if status != 'OK':
+            print(f"Failed to list mailboxes: {status}")
+            return
+            
+        print("\nAvailable mailboxes:")
+        print("--------------------")
+        for i, mailbox in enumerate(mailboxes, 1):
+            # Parse the mailbox name from the response
+            if isinstance(mailbox, bytes):
+                mailbox = mailbox.decode('utf-8', errors='replace')
+                
+            # The format is typically like: (\\HasNoChildren) "/" "INBOX.Sent"
+            parts = mailbox.split(' "')
+            if len(parts) > 1:
+                # Extract the mailbox name (removing trailing quote)
+                name = parts[-1].rstrip('"')
+                print(f"{i}. {name}")
+            else:
+                print(f"{i}. {mailbox}")
+        print("\nUse any of these names with the --mailbox argument")
+    
+    finally:
+        try:
+            await loop.run_in_executor(None, lambda: imap.logout())
+        except Exception as e:
+            print(f"Error during logout: {e}")
 
 async def fetch_headers(db, host, user, creds, mailbox='INBOX'):
     # Initialize the checkpoint manager
@@ -489,14 +547,15 @@ async def fetch_headers(db, host, user, creds, mailbox='INBOX'):
                             
                             # Insert this email
                             await db.execute(
-                                'INSERT OR REPLACE INTO emails(uid, msg_from, msg_to, msg_cc, subject, msg_date) VALUES(?,?,?,?,?,?)',
+                                'INSERT OR REPLACE INTO emails(uid, msg_from, msg_to, msg_cc, subject, msg_date, mailbox) VALUES(?,?,?,?,?,?,?)',
                                 (
                                     uid,
                                     decode_field(msg.get('From', '')),
                                     decode_field(msg.get('To', '')),
                                     decode_field(msg.get('Cc', '')),
                                     decode_field(msg.get('Subject', '')),
-                                    iso_date
+                                    iso_date,
+                                    mailbox
                                 )
                             )
                             saved_count += 1
@@ -679,12 +738,19 @@ async def main():
     parser.add_argument('--user', required=True, help='Gmail address')
     parser.add_argument('--mailbox', default='INBOX', help='Mailbox name')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--list-mailboxes', action='store_true', help='List available mailboxes and exit')
     args = parser.parse_args()
     
     global DEBUG
     DEBUG = args.debug or DEBUG
 
     creds = get_credentials(args.creds)
+    
+    # If the user wants to list mailboxes, do that and exit
+    if args.list_mailboxes:
+        await list_mailboxes(args.host, args.user, creds)
+        return
+    
     async with aiosqlite.connect(args.db) as db:
         await setup_schema(db)
         await fetch_headers(db, args.host, args.user, creds, args.mailbox)
