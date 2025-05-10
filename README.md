@@ -1,6 +1,6 @@
 # SyncEmMail
 
-A Python tool to efficiently sync Gmail email headers to a local SQLite database using OAuth 2.0 authentication. But before you go...
+A Python tool to efficiently sync Gmail email headers and content to a local SQLite database using OAuth 2.0 authentication. But before you go...
 
 ## Responsible AI usage
 
@@ -10,25 +10,45 @@ This project is yet another product of AI-assisted development (or as the hipste
 
 - **OAuth 2.0 Authentication**: Secure access to Gmail without storing your password
 - **Header-Only Sync**: Efficiently stores only email metadata, not full content
+- **Full Email Mode**: Option to download and store complete emails including attachments
 - **Incremental Updates**: Resumes where it left off for efficient syncing
 - **Checkpoint System**: Saves progress regularly to prevent data loss
 - **Error Handling**: Tracks failed emails for retry in subsequent runs
 - **SQLite Storage**: Fast, portable database that requires no separate server
+- **Query Mode**: Built-in analytical queries for exploring your email data
+- **Smart Schema Migration**: Automatically updates database schema when needed
+
+## Requirements
+
+- Python 3.7 or higher
+- [uv](https://github.com/astral-sh/uv) - Fast Python package installer and resolver (recommended)
+- Required packages (installed via `uv pip install -r requirements.txt`):
+  - aiosqlite: Asynchronous SQLite database access
+  - google-auth, google-auth-oauthlib: OAuth2 authentication with Google
+  - tqdm: Progress bars for sync operations
+  - tabulate: Formatted table output for query results
 
 ## Installation
 
 1. Clone this repository:
    ```
-   git clone https://github.com/yourusername/syncemail.git
-   cd syncemmail
+   git clone https://github.com/hugoferreira/gmail-sqlite-db.git
+   cd gmail-sqlite-db
    ```
 
-2. Install the required dependencies:
+2. Install `uv` if you don't have it yet:
    ```
-   pip install -r requirements.txt
+   pip install uv
    ```
 
-3. Create OAuth 2.0 credentials:
+3. Create a virtual environment and install dependencies:
+   ```
+   uv venv
+   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+   uv pip install -r requirements.txt
+   ```
+
+4. Create OAuth 2.0 credentials:
    - Go to the [Google Cloud Console](https://console.cloud.google.com/)
    - Create a new project
    - Enable the Gmail API
@@ -40,28 +60,145 @@ This project is yet another product of AI-assisted development (or as the hipste
 Run the tool with the following command:
 
 ```
-python main.py --db ./mail.sqlite3 --creds creds.json --user your.email@gmail.com
+uv run --active main.py --db ./mail.sqlite3 --creds creds.json --user your.email@gmail.com
 ```
 
 ### Command Line Arguments
 
 - `--db`: Path to SQLite database (default: `emails.db`)
-- `--creds`: Path to OAuth2 client secrets JSON (required)
+- `--creds`: Path to OAuth2 client secrets JSON (required for sync modes)
 - `--host`: IMAP host (default: `imap.gmail.com`)
-- `--user`: Gmail address (required)
+- `--user`: Gmail address (required for sync modes)
 - `--mailbox`: Mailbox name (default: `INBOX`)
 - `--debug`: Enable debug mode
 - `--list-mailboxes`: List available mailboxes and exit
+- `--mode`: Execution mode: `headers` (default), `full` (fetch full emails), or `query` (run queries)
+
+### Syncing Email Headers
+
+To sync only email headers (default mode):
+
+```
+uv run --active main.py --creds creds.json --user your.email@gmail.com
+```
+
+### Syncing Full Emails
+
+To download complete emails including attachments:
+
+```
+uv run --active main.py --mode full --creds creds.json --user your.email@gmail.com
+```
+
+Note: Always sync headers first before syncing full emails.
 
 ### Listing Available Mailboxes
 
 To see all available mailboxes in your email account, use the `--list-mailboxes` argument:
 
 ```
-python main.py --creds creds.json --user your.email@gmail.com --list-mailboxes
+uv run --active main.py --creds creds.json --user your.email@gmail.com --list-mailboxes
 ```
 
 This will display a list of all mailboxes you can access, which you can then use with the `--mailbox` argument to sync emails from a specific mailbox.
+
+### Query Mode
+
+The query mode allows you to run predefined analytical queries on your email database:
+
+#### List Available Queries
+
+```
+uv run --active main.py --mode query --list-queries
+```
+
+#### Running Queries
+
+To run a specific query:
+
+```
+uv run --active main.py --mode query --db ./mail.sqlite3 --query top_senders
+```
+
+#### Query Parameters
+
+The following parameters can be used to customize queries:
+
+- `--limit`: Maximum number of results to return
+- `--start-date`: Start date for date range queries (YYYY-MM-DD format)
+- `--end-date`: End date for date range queries (YYYY-MM-DD format)
+- `--message-id`: Message ID for thread queries
+
+#### Query Examples
+
+1. Get top email senders:
+   ```
+   uv run --active main.py --mode query --query top_senders --limit 20
+   ```
+
+2. View emails from a specific date range:
+   ```
+   uv run --active main.py --mode query --query date_range --start-date 2023-01-01 --end-date 2023-12-31
+   ```
+
+3. Find large emails with attachments:
+   ```
+   uv run --active main.py --mode query --query large_attachments
+   ```
+
+4. See recent emails:
+   ```
+   uv run --active main.py --mode query --query recent --limit 10
+   ```
+
+5. Get a summary of your email database:
+   ```
+   uv run --active main.py --mode query --query summary
+   ```
+
+6. See distribution of emails by domain:
+   ```
+   uv run --active main.py --mode query --query email_domains
+   ```
+
+7. View emails with images:
+   ```
+   uv run --active main.py --mode query --query emails_with_images
+   ```
+
+8. See emails in a conversation thread (requires message ID):
+   ```
+   uv run --active main.py --mode query --query thread --message-id "<message-id@example.com>"
+   ```
+   
+### Extending Query Mode
+
+You can add your own custom queries by modifying the `QUERIES` dictionary in `main.py`. Each query requires the following elements:
+
+```python
+'my_query': {
+    'name': 'My Custom Query',
+    'description': 'What this query does',
+    'query': '''
+        SELECT field1, field2
+        FROM table
+        WHERE condition = ?
+        LIMIT ?;
+    ''',
+    'params': {'param1': default_value, 'limit': 10},
+}
+```
+
+For queries that need to create views or temporary tables, use the `setup` key:
+
+```python
+'setup': '''
+    CREATE VIEW IF NOT EXISTS my_view AS
+    SELECT field1, COUNT(*) as count
+    FROM table
+    GROUP BY field1;
+''',
+```
 
 ## Database Schema
 
@@ -218,6 +355,33 @@ JOIN emails e ON t.uid = e.uid AND t.mailbox = e.mailbox
 ORDER BY e.msg_date;
 ```
 
+## Troubleshooting
+
+### Running with uv
+
+- **Virtual Environment Issues**: If you see `ModuleNotFoundError` for packages that should be installed, make sure to:
+  1. Verify the package is installed with `uv pip list`
+  2. Always use `uv run --active` to run the script to ensure it uses the active virtual environment
+  3. If packages are missing, reinstall them with `uv pip install -r requirements.txt`
+
+- **Environment Conflicts**: If you see warnings about environment paths not matching, use the `--active` flag with uv run to explicitly use the active environment.
+
+### Database Issues
+
+- **Missing Columns Error**: If you see errors like `no such column: has_images`, run the tool again. It will automatically detect and fix the database schema.
+- **Database Locked**: If the database is locked, ensure no other process is using it and try again.
+- **Performance Issues**: For large databases, consider using the `--limit` parameter with queries to reduce result size.
+
+### OAuth2 Issues
+
+- **Authentication Errors**: Ensure your `creds.json` file is valid and you've enabled the Gmail API
+- **Token Expiration**: If your token expires, the tool will attempt to refresh it automatically. If that fails, delete `token.json` and run the tool again.
+
+### IMAP Issues
+
+- **Connection Timeout**: Check your internet connection or try again later
+- **Rate Limiting**: Gmail has rate limits - the tool applies small delays but might still hit limits with large mailboxes
+
 ## How It Works
 
 1. The tool authenticates with Gmail using OAuth 2.0
@@ -225,14 +389,8 @@ ORDER BY e.msg_date;
 3. It determines which emails are new since the last sync
 4. It downloads just the header information for new emails
 5. Headers are parsed and stored in the SQLite database
-6. Progress is saved in checkpoints for resumable operation
-
-## Troubleshooting
-
-- **Authentication Issues**: Ensure your `creds.json` file is valid and you've enabled the Gmail API
-- **Permission Errors**: You may need to allow "Less secure app access" in your Google account
-- **Database Locked**: If the database is locked, ensure no other process is using it
-- **Rate Limiting**: Gmail has rate limits - the tool automatically applies small delays
+6. (Optional) Full email content can be downloaded in a second pass
+7. Progress is saved in checkpoints for resumable operation
 
 ## License
 

@@ -7,8 +7,10 @@ import json
 import os
 import re
 import sys
+import textwrap
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
+from typing import List, Dict, Any
 
 # Third-party imports
 import aiosqlite
@@ -16,6 +18,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from tqdm import tqdm
+import tabulate
 
 # OAuth2 setup
 SCOPES = ['https://mail.google.com/']
@@ -23,6 +26,160 @@ TOKEN_PATH = 'token.json'
 CHUNK_SIZE = 250  # Reduced for more reliable processing and frequent commits
 EMAILS_PER_COMMIT = 20  # Commit after processing this many emails
 DEBUG = False   # Enable debug mode - set to False by default for full processing
+
+# Predefined queries
+QUERIES = {
+    'top_senders': {
+        'name': 'Top Email Senders',
+        'description': 'Shows the top email senders by count',
+        'query': '''
+            SELECT msg_from, COUNT(*) as count 
+            FROM emails 
+            GROUP BY msg_from 
+            ORDER BY count DESC 
+            LIMIT ?;
+        ''',
+        'params': {'limit': 10},
+    },
+    'email_addresses': {
+        'name': 'Extracted Email Addresses',
+        'description': 'Extracts and counts unique email addresses from the sender field',
+        'setup': '''
+            CREATE VIEW IF NOT EXISTS email_senders AS 
+            SELECT 
+                SUBSTR(msg_from, INSTR(msg_from, '<') + 1, INSTR(msg_from, '>') - INSTR(msg_from, '<') - 1) AS email_address, 
+                COUNT(*) as count 
+            FROM emails 
+            WHERE INSTR(msg_from, '<') > 0 AND INSTR(msg_from, '>') > INSTR(msg_from, '<') 
+            GROUP BY email_address 
+            ORDER BY count DESC;
+        ''',
+        'query': '''
+            SELECT * FROM email_senders LIMIT ?;
+        ''',
+        'params': {'limit': 20},
+    },
+    'email_domains': {
+        'name': 'Email Domains',
+        'description': 'Shows the distribution of email domains',
+        'setup': '''
+            CREATE VIEW IF NOT EXISTS domain_senders AS 
+            SELECT 
+                SUBSTR(msg_from, INSTR(msg_from, '@') + 1, INSTR(msg_from, '>') - INSTR(msg_from, '@') - 1) AS domain, 
+                COUNT(*) as count 
+            FROM emails 
+            WHERE INSTR(msg_from, '@') > 0 AND INSTR(msg_from, '>') > INSTR(msg_from, '@') 
+            GROUP BY domain 
+            ORDER BY count DESC;
+        ''',
+        'query': '''
+            SELECT * FROM domain_senders LIMIT ?;
+        ''',
+        'params': {'limit': 20},
+    },
+    'date_range': {
+        'name': 'Emails by Date Range',
+        'description': 'Shows emails within a specified date range',
+        'query': '''
+            SELECT uid, msg_from, msg_to, subject, msg_date 
+            FROM emails 
+            WHERE msg_date BETWEEN ? AND ? 
+            ORDER BY msg_date DESC
+            LIMIT ?;
+        ''',
+        'params': {
+            'start_date': datetime.date.today().replace(day=1).isoformat(),  # First day of current month
+            'end_date': datetime.date.today().isoformat(),  # Today
+            'limit': 50
+        },
+    },
+    'mailbox_count': {
+        'name': 'Count by Mailbox',
+        'description': 'Shows the distribution of emails across mailboxes',
+        'query': '''
+            SELECT 
+                mailbox, 
+                COUNT(*) as email_count 
+            FROM emails 
+            GROUP BY mailbox 
+            ORDER BY email_count DESC;
+        ''',
+    },
+    'large_attachments': {
+        'name': 'Large Emails with Attachments',
+        'description': 'Shows the largest emails with attachments',
+        'query': '''
+            SELECT e.subject, f.message_size_kb, e.msg_date, e.msg_from
+            FROM emails e
+            JOIN full_emails f ON e.uid = f.uid AND e.mailbox = f.mailbox
+            WHERE f.has_attachments = 1
+            ORDER BY f.message_size_kb DESC
+            LIMIT ?;
+        ''',
+        'params': {'limit': 20},
+    },
+    'emails_with_images': {
+        'name': 'Emails with Images',
+        'description': 'Shows emails containing embedded images',
+        'query': '''
+            SELECT e.subject, e.msg_from, e.msg_date
+            FROM emails e
+            JOIN full_emails f ON e.uid = f.uid AND e.mailbox = f.mailbox
+            WHERE f.has_images = 1
+            ORDER BY e.msg_date DESC
+            LIMIT ?;
+        ''',
+        'params': {'limit': 50},
+    },
+    'thread': {
+        'name': 'Email Thread',
+        'description': 'Shows all emails in a conversation thread',
+        'query': '''
+            WITH RECURSIVE thread(uid, mailbox, message_id, level) AS (
+                -- Start with a specific message ID
+                SELECT uid, mailbox, message_id, 0
+                FROM full_emails
+                WHERE message_id = ?
+                
+                UNION ALL
+                
+                -- Find all replies
+                SELECT f.uid, f.mailbox, f.message_id, t.level + 1
+                FROM full_emails f
+                JOIN thread t ON f.in_reply_to = t.message_id
+            )
+            SELECT e.subject, e.msg_from, e.msg_date, t.level
+            FROM thread t
+            JOIN emails e ON t.uid = e.uid AND t.mailbox = e.mailbox
+            ORDER BY e.msg_date;
+        ''',
+        'params': {'message_id': '<example-message-id@domain.com>'},
+    },
+    'summary': {
+        'name': 'Database Summary',
+        'description': 'Shows a summary of the database contents',
+        'query': '''
+            SELECT 
+                (SELECT COUNT(*) FROM emails) AS total_emails,
+                (SELECT COUNT(*) FROM full_emails) AS full_emails,
+                (SELECT COUNT(DISTINCT mailbox) FROM emails) AS mailbox_count,
+                (SELECT COUNT(DISTINCT msg_from) FROM emails) AS unique_senders,
+                (SELECT COUNT(*) FROM full_emails WHERE has_attachments = 1) AS emails_with_attachments,
+                (SELECT COUNT(*) FROM full_emails WHERE has_images = 1) AS emails_with_images;
+        ''',
+    },
+    'recent': {
+        'name': 'Recent Emails',
+        'description': 'Shows the most recent emails',
+        'query': '''
+            SELECT uid, msg_from, subject, msg_date, mailbox
+            FROM emails
+            ORDER BY msg_date DESC
+            LIMIT ?;
+        ''',
+        'params': {'limit': 20},
+    },
+}
 
 def debug_print(*args, **kwargs):
     if DEBUG:
@@ -1009,21 +1166,141 @@ async def display_mailboxes(imap_client):
         print(f"{i}. {mailbox}")
     print("\nUse any of these names with the --mailbox argument")
 
+async def execute_query(db, query_name, **query_params):
+    """Execute a predefined query with parameters"""
+    if query_name not in QUERIES:
+        print(f"Error: Query '{query_name}' not found. Available queries:")
+        for name, details in QUERIES.items():
+            print(f"  - {name}: {details['description']}")
+        return
+    
+    query_info = QUERIES[query_name]
+    print(f"\n=== {query_info['name']} ===")
+    print(f"{query_info['description']}")
+    
+    # Run setup query if present (for views)
+    if 'setup' in query_info:
+        try:
+            await db.execute(query_info['setup'])
+        except Exception as e:
+            print(f"Setup error: {e}")
+    
+    # Prepare parameters
+    params = []
+    if 'params' in query_info:
+        # Merge default params with user-provided params
+        merged_params = query_info['params'].copy()
+        merged_params.update(query_params)
+        
+        # Convert param dict to ordered list based on parameter positions in query
+        query_text = query_info['query']
+        params = [merged_params[name] for name in merged_params]
+    
+    try:
+        # Execute the query
+        async with db.execute(query_info['query'], params) as cursor:
+            # Get column names from cursor description
+            columns = [col[0] for col in cursor.description] if cursor.description else []
+            
+            # Fetch all rows
+            rows = await cursor.fetchall()
+            
+            if not rows:
+                print("\nNo results found.")
+                return
+            
+            # Format and print results
+            print(f"\nFound {len(rows)} results:")
+            print(tabulate.tabulate(rows, headers=columns, tablefmt='psql'))
+            
+            # For long result sets, summarize
+            if len(rows) >= 20:
+                print(f"\nDisplayed {len(rows)} results.")
+    
+    except Exception as e:
+        print(f"Query execution error: {e}")
+
+async def list_available_queries():
+    """List all available queries"""
+    print("\nAvailable queries:")
+    print("==================")
+    
+    for name, details in QUERIES.items():
+        print(f"\n{name}: {details['name']}")
+        print(f"  {details['description']}")
+        
+        # Show parameters if any
+        if 'params' in details:
+            print("  Parameters:")
+            for param_name, default_value in details['params'].items():
+                print(f"    --{param_name}={default_value}")
+
 async def main():
     parser = argparse.ArgumentParser(description='Fetch Gmail emails to SQLite using OAuth2')
     parser.add_argument('--db', default='emails.db', help='Path to SQLite database')
-    parser.add_argument('--creds', required=True, help='Path to OAuth2 client secrets JSON')
+    parser.add_argument('--creds', help='Path to OAuth2 client secrets JSON')
     parser.add_argument('--host', default='imap.gmail.com', help='IMAP host')
-    parser.add_argument('--user', required=True, help='Gmail address')
+    parser.add_argument('--user', help='Gmail address')
     parser.add_argument('--mailbox', default='INBOX', help='Mailbox name')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--list-mailboxes', action='store_true', help='List available mailboxes and exit')
-    parser.add_argument('--mode', choices=['headers', 'full'], default='headers', help='Execution mode: headers (default) or full (fetch full emails)')
+    parser.add_argument('--mode', choices=['headers', 'full', 'query'], default='headers', 
+                        help='Execution mode: headers (default), full (fetch full emails), or query (run queries)')
+    
+    # Query mode arguments
+    parser.add_argument('--query', help='Name of query to execute (use --list-queries to see available queries)')
+    parser.add_argument('--list-queries', action='store_true', help='List available queries')
+    
+    # Dynamic query parameters
+    parser.add_argument('--limit', type=int, help='Limit for query results')
+    parser.add_argument('--start-date', help='Start date for date range queries (YYYY-MM-DD)')
+    parser.add_argument('--end-date', help='End date for date range queries (YYYY-MM-DD)')
+    parser.add_argument('--message-id', help='Message ID for thread queries')
+    
     args = parser.parse_args()
     
     global DEBUG
     DEBUG = args.debug or DEBUG
 
+    # Query mode doesn't require credentials
+    if args.mode == 'query' or args.list_queries:
+        # Create database manager
+        db_manager = DatabaseManager(args.db)
+        db = await db_manager.connect()
+        
+        try:
+            if args.list_queries:
+                await list_available_queries()
+                return
+                
+            if not args.query:
+                print("Error: --query parameter is required in query mode")
+                await list_available_queries()
+                return
+                
+            # Extract query parameters from args
+            query_params = {}
+            if args.limit is not None:
+                query_params['limit'] = args.limit
+            if args.start_date:
+                query_params['start_date'] = args.start_date
+            if args.end_date:
+                query_params['end_date'] = args.end_date
+            if args.message_id:
+                query_params['message_id'] = args.message_id
+                
+            await execute_query(db, args.query, **query_params)
+            
+        finally:
+            await db_manager.close()
+        return
+    
+    # Credential check for non-query modes
+    if not args.creds:
+        sys.exit("Error: --creds parameter is required for sync modes")
+    if not args.user:
+        sys.exit("Error: --user parameter is required for sync modes")
+    
     # Get OAuth2 credentials
     creds = get_credentials(args.creds)
     
