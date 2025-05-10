@@ -20,9 +20,6 @@ from tqdm import tqdm
 # OAuth2 setup
 SCOPES = ['https://mail.google.com/']
 TOKEN_PATH = 'token.json'
-CHECKPOINT_PATH = 'checkpoint.json'  # Default (legacy support)
-CHECKPOINT_HEADERS_PATH = 'checkpoint_headers.json'
-CHECKPOINT_FULL_PATH = 'checkpoint_full.json'
 CHUNK_SIZE = 250  # Reduced for more reliable processing and frequent commits
 EMAILS_PER_COMMIT = 20  # Commit after processing this many emails
 DEBUG = False   # Enable debug mode - set to False by default for full processing
@@ -31,10 +28,15 @@ def debug_print(*args, **kwargs):
     if DEBUG:
         print(*args, **kwargs)
 
-# Checkpoint system for tracking sync state
+# Unified checkpoint system
 class CheckpointManager:
-    def __init__(self, checkpoint_path=CHECKPOINT_PATH):
-        self.checkpoint_path = checkpoint_path
+    def __init__(self, mode='headers'):
+        """Initialize checkpoint manager with a specific mode
+        
+        Args:
+            mode: Sync mode - 'headers' or 'full'
+        """
+        self.checkpoint_path = f'checkpoint_{mode}.json'
         self.state = self._load_state()
         
     def _load_state(self):
@@ -110,7 +112,407 @@ class CheckpointManager:
         """Check if a previous sync was interrupted"""
         return self.state['in_progress']
 
-# Obtain or refresh OAuth2 credentials via "Sign in with Google"
+# Database connection manager
+class DatabaseManager:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.db = None
+
+    async def connect(self):
+        """Connect to the database"""
+        self.db = await aiosqlite.connect(self.db_path)
+        await self.setup_schema()
+        return self.db
+        
+    async def close(self):
+        """Close the database connection"""
+        if self.db:
+            await self.db.commit()
+            await self.db.close()
+            
+    async def commit_with_retry(self, max_retries=3):
+        """Commit transaction with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                await self.db.commit()
+                try:
+                    await self.db.execute("BEGIN TRANSACTION")
+                except:
+                    pass  # Transaction already started
+                return True
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"Failed to commit after {max_retries} attempts: {e}")
+                    return False
+                await asyncio.sleep(0.1 * (attempt + 1))  # Exponential backoff
+        
+    async def setup_schema(self):
+        """Set up the database schema"""
+        # Performance pragmas for better SQLite performance
+        await self.db.execute("PRAGMA journal_mode=WAL;")
+        await self.db.execute("PRAGMA synchronous=NORMAL;")
+        await self.db.execute("PRAGMA temp_store=MEMORY;")
+        await self.db.execute("PRAGMA cache_size=-50000;")  # Use about 50MB of memory for caching
+        await self.db.execute("PRAGMA foreign_keys=OFF;")   # Disable foreign key checks for imports
+        
+        # Create emails table if it doesn't exist
+        await self.db.execute('''
+            CREATE TABLE IF NOT EXISTS emails (
+                uid TEXT PRIMARY KEY,
+                msg_from TEXT,
+                msg_to TEXT,
+                msg_cc TEXT,
+                subject TEXT,
+                msg_date TEXT,
+                mailbox TEXT
+            )
+        ''')
+        
+        # Add indexes
+        await self.db.execute('CREATE INDEX IF NOT EXISTS idx_from ON emails(msg_from)')
+        await self.db.execute('CREATE INDEX IF NOT EXISTS idx_to ON emails(msg_to)')
+        await self.db.execute('CREATE INDEX IF NOT EXISTS idx_cc ON emails(msg_cc)')
+        await self.db.execute('CREATE INDEX IF NOT EXISTS idx_date ON emails(msg_date)')
+        await self.db.execute('CREATE INDEX IF NOT EXISTS idx_mailbox ON emails(mailbox)')
+        
+        # Create sync_status table
+        await self.db.execute('''
+            CREATE TABLE IF NOT EXISTS sync_status (
+                id INTEGER PRIMARY KEY,
+                last_uid INTEGER,
+                start_time TEXT,
+                end_time TEXT,
+                status TEXT,
+                message TEXT
+            )
+        ''')
+        
+        # Check and create full_emails table with generated columns
+        await self._setup_full_emails_table()
+        
+        await self.db.commit()
+        
+    async def _setup_full_emails_table(self):
+        """Set up the full_emails table with all generated columns"""
+        # Check if table exists
+        table_exists = False
+        need_migration = False
+        
+        async with self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='full_emails'") as cursor:
+            row = await cursor.fetchone()
+            if row:
+                table_exists = True
+                
+                # Check if it has the generated columns
+                async with self.db.execute("PRAGMA table_xinfo(full_emails)") as cursor:
+                    columns = await cursor.fetchall()
+                    has_generated_columns = False
+                    for col in columns:
+                        if col[1] == 'has_attachments' and col[6] > 0:  # col[6] > 0 means it's a generated column
+                            has_generated_columns = True
+                            break
+                    
+                    if not has_generated_columns:
+                        need_migration = True
+                        print("Migrating full_emails table to add generated columns...")
+        
+        if need_migration and table_exists:
+            # Create new table with generated columns
+            await self._create_full_emails_table('full_emails_new')
+            
+            # Copy data from old table to new table
+            print("Copying email data to new table with generated columns...")
+            await self.db.execute("INSERT INTO full_emails_new (uid, mailbox, raw_email, fetched_at) SELECT uid, mailbox, raw_email, fetched_at FROM full_emails")
+            
+            # Drop old table and rename new one
+            await self.db.execute("DROP TABLE full_emails")
+            await self.db.execute("ALTER TABLE full_emails_new RENAME TO full_emails")
+            
+            # Create indexes
+            await self._create_full_emails_indexes()
+            
+            print("Migration complete!")
+        elif not table_exists:
+            # Create table with generated columns
+            await self._create_full_emails_table('full_emails')
+            await self._create_full_emails_indexes()
+        else:
+            # Check and create any missing indexes
+            await self._ensure_full_emails_indexes()
+    
+    async def _create_full_emails_table(self, table_name):
+        """Create the full_emails table with all generated columns"""
+        await self.db.execute(f'''
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                uid TEXT PRIMARY KEY,
+                mailbox TEXT,
+                raw_email BLOB,
+                fetched_at TEXT,
+                has_attachments BOOLEAN GENERATED ALWAYS AS (
+                    instr(raw_email, 'Content-Disposition: attachment') > 0 
+                    OR instr(raw_email, 'Content-Type: image/') > 0
+                    OR instr(raw_email, 'Content-Type: application/') > 0
+                    OR instr(raw_email, 'Content-Type: audio/') > 0
+                    OR instr(raw_email, 'Content-Type: video/') > 0
+                    OR (instr(raw_email, 'Content-Disposition: inline') > 0 AND instr(raw_email, 'filename=') > 0)
+                ) VIRTUAL,
+                message_size_kb INTEGER GENERATED ALWAYS AS (
+                    length(raw_email) / 1024
+                ) VIRTUAL,
+                is_html BOOLEAN GENERATED ALWAYS AS (
+                    instr(raw_email, 'Content-Type: text/html') > 0
+                ) VIRTUAL,
+                is_plain_text BOOLEAN GENERATED ALWAYS AS (
+                    instr(raw_email, 'Content-Type: text/plain') > 0
+                ) VIRTUAL,
+                has_images BOOLEAN GENERATED ALWAYS AS (
+                    instr(raw_email, 'Content-Type: image/') > 0
+                ) VIRTUAL,
+                in_reply_to TEXT GENERATED ALWAYS AS (
+                    CASE 
+                        WHEN instr(raw_email, 'In-Reply-To: ') > 0 
+                        THEN substr(
+                            raw_email,
+                            instr(raw_email, 'In-Reply-To: ') + 13,
+                            instr(substr(raw_email, instr(raw_email, 'In-Reply-To: ') + 13), CHAR(10)) - 1
+                        )
+                        ELSE NULL
+                    END
+                ) VIRTUAL,
+                message_id TEXT GENERATED ALWAYS AS (
+                    CASE 
+                        WHEN instr(raw_email, 'Message-ID: ') > 0 
+                        THEN substr(
+                            raw_email,
+                            instr(raw_email, 'Message-ID: ') + 12,
+                            instr(substr(raw_email, instr(raw_email, 'Message-ID: ') + 12), CHAR(10)) - 1
+                        )
+                        ELSE NULL
+                    END
+                ) VIRTUAL
+            )
+        ''')
+    
+    async def _create_full_emails_indexes(self):
+        """Create all indexes for the full_emails table"""
+        print("Creating indexes for optimized queries...")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_full_emails_has_attachments ON full_emails(has_attachments)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_full_emails_message_size ON full_emails(message_size_kb)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_full_emails_is_html ON full_emails(is_html)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_full_emails_has_images ON full_emails(has_images)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_full_emails_in_reply_to ON full_emails(in_reply_to)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_full_emails_message_id ON full_emails(message_id)")
+        await self.db.execute("CREATE INDEX IF NOT EXISTS idx_full_emails_mailbox ON full_emails(mailbox)")
+    
+    async def _ensure_full_emails_indexes(self):
+        """Check and create any missing indexes for the full_emails table"""
+        print("Checking and creating missing indexes...")
+        
+        # First check if table exists
+        async with self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='full_emails'") as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                # Table doesn't exist, create it first
+                await self._create_full_emails_table('full_emails')
+                await self._create_full_emails_indexes()
+                return
+        
+        # Check if columns exist by querying table info
+        columns = {}
+        async with self.db.execute("PRAGMA table_xinfo(full_emails)") as cursor:
+            rows = await cursor.fetchall()
+            for col in rows:
+                columns[col[1]] = {
+                    'name': col[1],
+                    'is_generated': col[6] > 0  # col[6] > 0 means it's a generated column
+                }
+        
+        # If missing important generated columns, recreate the table
+        required_columns = ['has_attachments', 'message_size_kb', 'is_html', 
+                           'is_plain_text', 'has_images', 'in_reply_to', 'message_id']
+        
+        missing_columns = [col for col in required_columns if col not in columns]
+        if missing_columns:
+            print(f"Missing columns in full_emails: {missing_columns}. Recreating table...")
+            # Get current data
+            existing_data = []
+            try:
+                async with self.db.execute("SELECT uid, mailbox, raw_email, fetched_at FROM full_emails") as cursor:
+                    existing_data = await cursor.fetchall()
+            except Exception as e:
+                print(f"Error fetching existing data: {e}")
+            
+            # Create new table
+            await self.db.execute("DROP TABLE IF EXISTS full_emails_new")
+            await self._create_full_emails_table('full_emails_new')
+            
+            # Copy data
+            if existing_data:
+                print(f"Copying {len(existing_data)} existing emails to new table structure...")
+                for row in existing_data:
+                    await self.db.execute(
+                        "INSERT INTO full_emails_new (uid, mailbox, raw_email, fetched_at) VALUES (?, ?, ?, ?)",
+                        row
+                    )
+            
+            # Replace old table
+            await self.db.execute("DROP TABLE IF EXISTS full_emails")
+            await self.db.execute("ALTER TABLE full_emails_new RENAME TO full_emails")
+        
+        # Now check and create any missing indexes
+        index_names = [
+            "idx_full_emails_has_attachments",
+            "idx_full_emails_message_size",
+            "idx_full_emails_is_html",
+            "idx_full_emails_has_images",
+            "idx_full_emails_in_reply_to",
+            "idx_full_emails_message_id",
+            "idx_full_emails_mailbox"
+        ]
+        
+        for index_name in index_names:
+            async with self.db.execute(f"SELECT name FROM sqlite_master WHERE type='index' AND name='{index_name}'") as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    try:
+                        # Create the missing index
+                        if index_name == "idx_full_emails_has_attachments":
+                            await self.db.execute("CREATE INDEX IF NOT EXISTS idx_full_emails_has_attachments ON full_emails(has_attachments)")
+                        elif index_name == "idx_full_emails_message_size":
+                            await self.db.execute("CREATE INDEX IF NOT EXISTS idx_full_emails_message_size ON full_emails(message_size_kb)")
+                        elif index_name == "idx_full_emails_is_html":
+                            await self.db.execute("CREATE INDEX IF NOT EXISTS idx_full_emails_is_html ON full_emails(is_html)")
+                        elif index_name == "idx_full_emails_has_images":
+                            await self.db.execute("CREATE INDEX IF NOT EXISTS idx_full_emails_has_images ON full_emails(has_images)")
+                        elif index_name == "idx_full_emails_in_reply_to":
+                            await self.db.execute("CREATE INDEX IF NOT EXISTS idx_full_emails_in_reply_to ON full_emails(in_reply_to)")
+                        elif index_name == "idx_full_emails_message_id":
+                            await self.db.execute("CREATE INDEX IF NOT EXISTS idx_full_emails_message_id ON full_emails(message_id)")
+                        elif index_name == "idx_full_emails_mailbox":
+                            await self.db.execute("CREATE INDEX IF NOT EXISTS idx_full_emails_mailbox ON full_emails(mailbox)")
+                        print(f"Created index {index_name}")
+                    except Exception as e:
+                        print(f"Error creating index {index_name}: {e}")
+                        # If we can't create an index, the column might be missing
+                        if "no such column" in str(e).lower():
+                            print(f"Column for index {index_name} is missing. Run the program again to recreate the table structure.")
+    
+    async def log_sync_start(self, message):
+        """Log the start of a sync operation"""
+        await self.db.execute('''
+            INSERT INTO sync_status (start_time, status, message)
+            VALUES (?, 'STARTED', ?)
+        ''', (datetime.datetime.now().isoformat(), message))
+        async with self.db.execute('SELECT last_insert_rowid()') as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+            
+    async def log_sync_finish(self, status_id, status, message):
+        """Log the completion of a sync operation"""
+        await self.db.execute(
+            "UPDATE sync_status SET end_time = ?, status = ?, message = ? WHERE id = ?", 
+            (datetime.datetime.now().isoformat(), status, message, status_id)
+        )
+        await self.db.commit()
+
+# Unified IMAP client
+class ImapClient:
+    def __init__(self, host, user, creds):
+        self.host = host
+        self.user = user
+        self.creds = creds
+        self.imap = None
+        self.current_mailbox = None
+        self.loop = asyncio.get_event_loop()
+        
+    async def connect(self):
+        """Connect to the IMAP server"""
+        print(f"Connecting to {self.host} as {self.user}...")
+        self.imap = await self.loop.run_in_executor(
+            None, lambda: self._login_oauth2()
+        )
+        print(f"Connection established successfully")
+        return self.imap
+        
+    def _login_oauth2(self):
+        """Authenticate with IMAP server using OAuth2"""
+        imap = imaplib.IMAP4_SSL(self.host)
+        auth_string = f"user={self.user}\x01auth=Bearer {self.creds.token}\x01\x01"
+        imap.authenticate('XOAUTH2', lambda x: auth_string)
+        return imap
+        
+    async def select_mailbox(self, mailbox, readonly=True):
+        """Select a mailbox"""
+        if self.current_mailbox == mailbox:
+            return True
+            
+        status, _ = await self.loop.run_in_executor(
+            None, lambda: self.imap.select(mailbox, readonly=readonly)
+        )
+        if status == 'OK':
+            self.current_mailbox = mailbox
+            return True
+        else:
+            print(f"Failed to select mailbox {mailbox}: {status}")
+            return False
+            
+    async def fetch(self, uid, fetch_type='headers'):
+        """Fetch email data by UID"""
+        fetch_command = None
+        if fetch_type == 'headers':
+            fetch_command = '(BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE)])'
+        elif fetch_type == 'full':
+            fetch_command = '(BODY.PEEK[])'
+            
+        status, data = await self.loop.run_in_executor(
+            None, lambda: self.imap.uid('FETCH', uid, fetch_command)
+        )
+        return status, data
+        
+    async def search_all(self):
+        """Search for all messages in the current mailbox"""
+        status, data = await self.loop.run_in_executor(
+            None, lambda: self.imap.uid('SEARCH', None, 'ALL')
+        )
+        if status != 'OK':
+            return []
+            
+        uid_list = data[0].decode().split() if isinstance(data[0], bytes) else data[0].split()
+        return list(map(str, uid_list))
+        
+    async def list_mailboxes(self):
+        """List all available mailboxes"""
+        status, mailboxes = await self.loop.run_in_executor(
+            None, lambda: self.imap.list()
+        )
+        if status != 'OK':
+            return []
+            
+        result = []
+        for mailbox in mailboxes:
+            if isinstance(mailbox, bytes):
+                mailbox = mailbox.decode('utf-8', errors='replace')
+                
+            # The format is typically like: (\\HasNoChildren) "/" "INBOX.Sent"
+            parts = mailbox.split(' "')
+            if len(parts) > 1:
+                # Extract the mailbox name (removing trailing quote)
+                name = parts[-1].rstrip('"')
+                result.append(name)
+            else:
+                result.append(mailbox)
+                
+        return result
+        
+    async def close(self):
+        """Close the IMAP connection"""
+        if self.imap:
+            try:
+                await self.loop.run_in_executor(None, lambda: self.imap.logout())
+            except Exception as e:
+                print(f"Error during logout: {e}")
+
+# Obtain or refresh OAuth2 credentials
 def get_credentials(creds_path):
     if not os.path.exists(creds_path):
         sys.exit(f"Error: OAuth2 client secrets JSON file not found at '{creds_path}'. Please download from Google Cloud Console.")
@@ -235,310 +637,125 @@ def parse_imap_response(data):
     debug_print(f"Extracted {len(messages)} message pairs")
     return messages
 
-async def setup_schema(db):
-    # Performance pragmas for better SQLite performance
-    await db.execute("PRAGMA journal_mode=WAL;")
-    await db.execute("PRAGMA synchronous=NORMAL;")
-    await db.execute("PRAGMA temp_store=MEMORY;")
-    await db.execute("PRAGMA cache_size=-50000;")  # Use about 50MB of memory for caching
-    await db.execute("PRAGMA foreign_keys=OFF;")   # Disable foreign key checks for imports
-    
-    # Check if we need to update the schema
-    async with db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='emails'") as cursor:
-        row = await cursor.fetchone()
-        
-    if row is None:
-        # Create table and indexes - using ISO 8601 format for date field for better querying
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS emails (
-                uid TEXT PRIMARY KEY,
-                msg_from TEXT,
-                msg_to TEXT,
-                msg_cc TEXT,
-                subject TEXT,
-                msg_date TEXT,
-                mailbox TEXT
-            )
-        ''')
-        # Add indexes
-        await db.execute('CREATE INDEX IF NOT EXISTS idx_from ON emails(msg_from)')
-        await db.execute('CREATE INDEX IF NOT EXISTS idx_to ON emails(msg_to)')
-        await db.execute('CREATE INDEX IF NOT EXISTS idx_cc ON emails(msg_cc)')
-        await db.execute('CREATE INDEX IF NOT EXISTS idx_date ON emails(msg_date)')
-        await db.execute('CREATE INDEX IF NOT EXISTS idx_mailbox ON emails(mailbox)')
-    else:
-        # Check if the table contains the mailbox column
-        has_mailbox_column = False
-        async with db.execute("PRAGMA table_info(emails)") as cursor:
-            rows = await cursor.fetchall()
-            for row in rows:
-                if row[1] == 'mailbox':
-                    has_mailbox_column = True
-                    break
-        
-        # Add the mailbox column if it doesn't exist
-        if not has_mailbox_column:
-            print("Adding 'mailbox' column to emails table...")
-            await db.execute('ALTER TABLE emails ADD COLUMN mailbox TEXT')
-            await db.execute('CREATE INDEX IF NOT EXISTS idx_mailbox ON emails(mailbox)')
-        
-        # Check if we need to add the date index
-        async with db.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_date'") as cursor:
-            row = await cursor.fetchone()
-        if row is None:
-            await db.execute('CREATE INDEX IF NOT EXISTS idx_date ON emails(msg_date)')
-    
-    # Create a table to track sync status for extra reliability
-    await db.execute('''
-        CREATE TABLE IF NOT EXISTS sync_status (
-            id INTEGER PRIMARY KEY,
-            last_uid INTEGER,
-            start_time TEXT,
-            end_time TEXT,
-            status TEXT,
-            message TEXT
-        )
-    ''')
-    
-    # Check if full_emails table needs to be migrated
-    need_migration = False
-    table_exists = False
-    
-    async with db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='full_emails'") as cursor:
-        row = await cursor.fetchone()
-        if row:
-            table_exists = True
-            
-            # Check if it has the generated columns
-            async with db.execute("PRAGMA table_xinfo(full_emails)") as cursor:
-                columns = await cursor.fetchall()
-                # Check if has_attachments column exists and is a generated column
-                has_generated_columns = False
-                for col in columns:
-                    if col[1] == 'has_attachments' and col[6] > 0:  # col[6] > 0 means it's a generated column
-                        has_generated_columns = True
-                        break
-                
-                if not has_generated_columns:
-                    need_migration = True
-                    print("Migrating full_emails table to add generated columns...")
-    
-    if need_migration and table_exists:
-        # Create new table with generated columns
-        await db.execute('''
-            CREATE TABLE full_emails_new (
-                uid TEXT PRIMARY KEY,
-                mailbox TEXT,
-                raw_email BLOB,
-                fetched_at TEXT,
-                has_attachments BOOLEAN GENERATED ALWAYS AS (
-                    instr(raw_email, 'Content-Disposition: attachment') > 0 
-                    OR instr(raw_email, 'Content-Type: image/') > 0
-                    OR instr(raw_email, 'Content-Type: application/') > 0
-                    OR instr(raw_email, 'Content-Type: audio/') > 0
-                    OR instr(raw_email, 'Content-Type: video/') > 0
-                    OR (instr(raw_email, 'Content-Disposition: inline') > 0 AND instr(raw_email, 'filename=') > 0)
-                ) VIRTUAL,
-                message_size_kb INTEGER GENERATED ALWAYS AS (
-                    length(raw_email) / 1024
-                ) VIRTUAL,
-                is_html BOOLEAN GENERATED ALWAYS AS (
-                    instr(raw_email, 'Content-Type: text/html') > 0
-                ) VIRTUAL,
-                is_plain_text BOOLEAN GENERATED ALWAYS AS (
-                    instr(raw_email, 'Content-Type: text/plain') > 0
-                ) VIRTUAL,
-                has_images BOOLEAN GENERATED ALWAYS AS (
-                    instr(raw_email, 'Content-Type: image/') > 0
-                ) VIRTUAL,
-                in_reply_to TEXT GENERATED ALWAYS AS (
-                    CASE 
-                        WHEN instr(raw_email, 'In-Reply-To: ') > 0 
-                        THEN substr(
-                            raw_email,
-                            instr(raw_email, 'In-Reply-To: ') + 13,
-                            instr(substr(raw_email, instr(raw_email, 'In-Reply-To: ') + 13), CHAR(10)) - 1
-                        )
-                        ELSE NULL
-                    END
-                ) VIRTUAL,
-                message_id TEXT GENERATED ALWAYS AS (
-                    CASE 
-                        WHEN instr(raw_email, 'Message-ID: ') > 0 
-                        THEN substr(
-                            raw_email,
-                            instr(raw_email, 'Message-ID: ') + 12,
-                            instr(substr(raw_email, instr(raw_email, 'Message-ID: ') + 12), CHAR(10)) - 1
-                        )
-                        ELSE NULL
-                    END
-                ) VIRTUAL
-            )
-        ''')
-        
-        # Copy data from old table to new table
-        print("Copying email data to new table with generated columns...")
-        await db.execute("INSERT INTO full_emails_new (uid, mailbox, raw_email, fetched_at) SELECT uid, mailbox, raw_email, fetched_at FROM full_emails")
-        
-        # Drop old table and rename new one
-        await db.execute("DROP TABLE full_emails")
-        await db.execute("ALTER TABLE full_emails_new RENAME TO full_emails")
-        
-        print("Migration complete!")
-    elif not table_exists:
-        # Create table with generated columns
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS full_emails (
-                uid TEXT PRIMARY KEY,
-                mailbox TEXT,
-                raw_email BLOB,
-                fetched_at TEXT,
-                has_attachments BOOLEAN GENERATED ALWAYS AS (
-                    instr(raw_email, 'Content-Disposition: attachment') > 0 
-                    OR instr(raw_email, 'Content-Type: image/') > 0
-                    OR instr(raw_email, 'Content-Type: application/') > 0
-                    OR instr(raw_email, 'Content-Type: audio/') > 0
-                    OR instr(raw_email, 'Content-Type: video/') > 0
-                    OR (instr(raw_email, 'Content-Disposition: inline') > 0 AND instr(raw_email, 'filename=') > 0)
-                ) VIRTUAL,
-                message_size_kb INTEGER GENERATED ALWAYS AS (
-                    length(raw_email) / 1024
-                ) VIRTUAL,
-                is_html BOOLEAN GENERATED ALWAYS AS (
-                    instr(raw_email, 'Content-Type: text/html') > 0
-                ) VIRTUAL,
-                is_plain_text BOOLEAN GENERATED ALWAYS AS (
-                    instr(raw_email, 'Content-Type: text/plain') > 0
-                ) VIRTUAL,
-                has_images BOOLEAN GENERATED ALWAYS AS (
-                    instr(raw_email, 'Content-Type: image/') > 0
-                ) VIRTUAL,
-                in_reply_to TEXT GENERATED ALWAYS AS (
-                    CASE 
-                        WHEN instr(raw_email, 'In-Reply-To: ') > 0 
-                        THEN substr(
-                            raw_email,
-                            instr(raw_email, 'In-Reply-To: ') + 13,
-                            instr(substr(raw_email, instr(raw_email, 'In-Reply-To: ') + 13), CHAR(10)) - 1
-                        )
-                        ELSE NULL
-                    END
-                ) VIRTUAL,
-                message_id TEXT GENERATED ALWAYS AS (
-                    CASE 
-                        WHEN instr(raw_email, 'Message-ID: ') > 0 
-                        THEN substr(
-                            raw_email,
-                            instr(raw_email, 'Message-ID: ') + 12,
-                            instr(substr(raw_email, instr(raw_email, 'Message-ID: ') + 12), CHAR(10)) - 1
-                        )
-                        ELSE NULL
-                    END
-                ) VIRTUAL
-            )
-        ''')
-    
-    await db.commit()
-
-# Create a non-async function to authenticate with IMAP using XOAUTH2
-def imap_oauth2_login(host, user, access_token):
-    # Connect to IMAP server
-    imap = imaplib.IMAP4_SSL(host)
-    
-    # Create the auth string in the format: "user=<email>\x01auth=Bearer <token>\x01\x01"
-    auth_string = f"user={user}\x01auth=Bearer {access_token}\x01\x01"
-    
-    # Authenticate using XOAUTH2
-    imap.authenticate('XOAUTH2', lambda x: auth_string)
-    
-    return imap
-
-async def list_mailboxes(host, user, creds):
-    """List all available mailboxes on the server"""
-    print(f"Connecting to {host} as {user}...")
-    
-    # Run the synchronous IMAP authentication in a thread pool
-    loop = asyncio.get_event_loop()
-    imap = await loop.run_in_executor(
-        None, 
-        lambda: imap_oauth2_login(host, user, creds.token)
-    )
-    
-    try:
-        print("Fetching mailboxes:")
-        status, mailboxes = await loop.run_in_executor(None, imap.list)
-        
-        if status != 'OK':
-            print(f"Failed to list mailboxes: {status}")
-            return
-            
-        print("\nAvailable mailboxes:")
-        print("--------------------")
-        for i, mailbox in enumerate(mailboxes, 1):
-            # Parse the mailbox name from the response
-            if isinstance(mailbox, bytes):
-                mailbox = mailbox.decode('utf-8', errors='replace')
-                
-            # The format is typically like: (\\HasNoChildren) "/" "INBOX.Sent"
-            parts = mailbox.split(' "')
-            if len(parts) > 1:
-                # Extract the mailbox name (removing trailing quote)
-                name = parts[-1].rstrip('"')
-                print(f"{i}. {name}")
-            else:
-                print(f"{i}. {mailbox}")
-        print("\nUse any of these names with the --mailbox argument")
-    
-    finally:
-        try:
-            await loop.run_in_executor(None, lambda: imap.logout())
-        except Exception as e:
-            print(f"Error during logout: {e}")
-
+# Email processor class for fetching and syncing emails
 class EmailSyncer:
-    def __init__(self, db, host, user, creds, mailbox, mode, fetch_fn):
-        self.db = db
-        self.host = host
-        self.user = user
-        self.creds = creds
-        self.mailbox = mailbox
+    def __init__(self, db_manager, imap_client, mode='headers'):
+        """Initialize the EmailSyncer
+        
+        Args:
+            db_manager: DatabaseManager instance
+            imap_client: ImapClient instance
+            mode: 'headers' or 'full'
+        """
+        self.db = db_manager.db
+        self.db_manager = db_manager
+        self.imap_client = imap_client
         self.mode = mode
-        self.fetch_fn = fetch_fn
-        # Use mode-specific checkpoint file
-        checkpoint_path = CHECKPOINT_HEADERS_PATH if mode == 'headers' else CHECKPOINT_FULL_PATH
-        self.checkpoint = CheckpointManager(checkpoint_path)
-        self.loop = asyncio.get_event_loop()
-        self.imap = None
+        self.checkpoint = CheckpointManager(mode)
         self.last_status_id = None
         self.failed_uids = self.checkpoint.get_failed_uids()
-        self.commit_interval = 1
         self.emails_since_commit = 0
         self.pbar = None
 
-    async def connect(self):
-        print(f"Connecting to {self.host} as {self.user} for {self.mode} sync...")
-        self.imap = await self.loop.run_in_executor(
-            None, lambda: imap_oauth2_login(self.host, self.user, self.creds.token)
-        )
-        print(f"Connection established successfully")
-
-    async def start_sync(self, start_message):
-        self.checkpoint.mark_start(self.mailbox)
-        await self.db.execute('''
-            INSERT INTO sync_status (start_time, status, message)
-            VALUES (?, 'STARTED', ?)
-        ''', (datetime.datetime.now().isoformat(), start_message))
-        async with self.db.execute('SELECT last_insert_rowid()') as cursor:
-            row = await cursor.fetchone()
-            self.last_status_id = row[0] if row else None
-
+    async def start_sync(self, mailbox, message):
+        """Start sync operation and log it"""
+        self.checkpoint.mark_start(mailbox)
+        self.last_status_id = await self.db_manager.log_sync_start(message)
+        
     async def finish_sync(self, status, message):
-        await self.db.execute(f"UPDATE sync_status SET end_time = ?, status = ?, message = ? WHERE id = ?", 
-                          (datetime.datetime.now().isoformat(), status, message, self.last_status_id))
-        await self.db.commit()
+        """Finish sync operation and log it"""
+        await self.db_manager.log_sync_finish(self.last_status_id, status, message)
         self.checkpoint.mark_complete()
-
+        
+    async def process_headers(self, uid, mailbox):
+        """Process email headers for a single UID"""
+        # Fetch headers
+        status, data = await self.imap_client.fetch(uid, 'headers')
+        if status != 'OK':
+            debug_print(f"Failed to fetch headers for UID {uid}: {status}")
+            self.checkpoint.add_failed_uid(uid)
+            return 'fail'
+            
+        # Extract header data
+        header_data = None
+        for item in data:
+            if isinstance(item, tuple) and len(item) > 1:
+                header_data = item[1]
+                break
+        
+        if not header_data:
+            debug_print(f"No header data found for UID {uid}")
+            self.checkpoint.add_failed_uid(uid)
+            return 'fail'
+            
+        # Parse email headers
+        msg = email.message_from_bytes(header_data if isinstance(header_data, bytes) else header_data.encode('utf-8'))
+        date_str = decode_field(msg.get('Date', ''))
+        iso_date = parse_email_date(date_str)
+        
+        # Save headers to database
+        await self.db.execute(
+            'INSERT OR REPLACE INTO emails(uid, msg_from, msg_to, msg_cc, subject, msg_date, mailbox) VALUES(?,?,?,?,?,?,?)',
+            (
+                uid,
+                decode_field(msg.get('From', '')),
+                decode_field(msg.get('To', '')),
+                decode_field(msg.get('Cc', '')),
+                decode_field(msg.get('Subject', '')),
+                iso_date,
+                mailbox
+            )
+        )
+        
+        # Update checkpoint and return success
+        self.checkpoint.update_progress(uid)
+        if uid in self.failed_uids:
+            self.checkpoint.clear_failed_uid(uid)
+        return 'saved'
+        
+    async def process_full_email(self, uid, mailbox):
+        """Process full email content for a single UID"""
+        debug_print(f"Fetching full email for UID {uid} in mailbox {mailbox}...")
+        
+        # Fetch full email
+        status, data = await self.imap_client.fetch(uid, 'full')
+        if status != 'OK' or not data:
+            print(f"[ERROR] Failed to fetch UID {uid}: status={status}, data_len={len(data) if data else 0}")
+            self.checkpoint.add_failed_uid(uid)
+            return 'fail'
+            
+        debug_print(f"Received data for UID {uid}, processing...")
+        
+        # Extract raw email data
+        raw_email = None
+        for item in data:
+            if isinstance(item, tuple) and len(item) > 1:
+                raw_email = item[1]
+                break
+                
+        if not raw_email:
+            if self.pbar and self.pbar.n < 10:
+                debug_print(f"[DEBUG] No raw email data found for UID {uid} in mailbox {mailbox}. Data: {data}")
+            self.checkpoint.add_failed_uid(uid)
+            return 'fail'
+            
+        # Save full email to database
+        await self.db.execute(
+            'INSERT OR REPLACE INTO full_emails(uid, mailbox, raw_email, fetched_at) VALUES(?,?,?,?)',
+            (uid, mailbox, raw_email, datetime.datetime.now().isoformat())
+        )
+        
+        # Update checkpoint and return success
+        if self.pbar and self.pbar.n < 10:
+            print(f"[DEBUG] Successfully saved full email for UID {uid} in mailbox {mailbox}.")
+            
+        self.checkpoint.update_progress(uid)
+        if uid in self.failed_uids:
+            self.checkpoint.clear_failed_uid(uid)
+        return 'saved'
+        
     async def run(self, uids_to_fetch, total_count, fetch_mode_desc):
+        """Run the sync process for a list of UIDs"""
         processed_count = 0
         skipped_count = 0
         saved_count = 0
@@ -555,62 +772,61 @@ class EmailSyncer:
         
         self.pbar = tqdm(total=total_count, desc=f'Fetching {fetch_mode_desc}')
         prev_mailbox = None
+        
         try:
             for chunk_idx, i in enumerate(range(0, len(uids_to_fetch), CHUNK_SIZE)):
                 chunk = uids_to_fetch[i:i + CHUNK_SIZE]
                 if not chunk:
                     continue
+                
                 for uid, mbox in chunk:
                     is_retry = uid in self.failed_uids
                     try:
-                        # Always select the correct mailbox before fetching
+                        # Select the correct mailbox before fetching
                         if prev_mailbox != mbox:
-                            status, _ = await self.loop.run_in_executor(None, lambda: self.imap.select(mbox, readonly=True))
-                            if status != 'OK':
-                                print(f"Failed to select mailbox {mbox}: {status}")
+                            if not await self.imap_client.select_mailbox(mbox):
                                 self.checkpoint.add_failed_uid(uid)
                                 skipped_count += 1
                                 self.pbar.update(1)
-                                prev_mailbox = mbox
                                 continue
                             prev_mailbox = mbox
-                        # Call the fetch function (header or full)
-                        result = await self.fetch_fn(self, uid, mbox)
+                            
+                        # Process email based on mode
+                        if self.mode == 'headers':
+                            result = await self.process_headers(uid, mbox)
+                        else:  # full mode
+                            result = await self.process_full_email(uid, mbox)
+                            
                         if result == 'fail':
                             skipped_count += 1
                         elif result == 'saved':
                             saved_count += 1
                             processed_count += 1
+                            
                         self.pbar.update(1)
                         self.emails_since_commit += 1
+                        
+                        # Commit periodically
                         if self.emails_since_commit >= EMAILS_PER_COMMIT:
                             self.checkpoint.save_state()
-                            try:
-                                await self.db.commit()
-                                try:
-                                    await self.db.execute("BEGIN TRANSACTION")
-                                except Exception as e:
-                                    debug_print(f"Transaction already started: {e}")
-                            except Exception as commit_err:
-                                print(f"Error committing transaction: {commit_err}")
+                            await self.db_manager.commit_with_retry()
                             self.emails_since_commit = 0
+                            
                     except Exception as e:
                         debug_print(f"Error processing UID {uid}: {e}")
                         self.checkpoint.add_failed_uid(uid)
                         skipped_count += 1
                         self.pbar.update(1)
-                if chunk_idx % self.commit_interval == 0:
+                        
+                # Commit after each chunk
+                if chunk_idx % 1 == 0:  # Commit after every chunk
                     self.checkpoint.save_state()
-                    try:
-                        await self.db.commit()
-                        try:
-                            await self.db.execute("BEGIN TRANSACTION")
-                        except Exception as e:
-                            debug_print(f"Transaction already started: {e}")
-                    except Exception as commit_err:
-                        print(f"Error committing transaction: {commit_err}")
+                    await self.db_manager.commit_with_retry()
+                    
+            # Final commit
             await self.db.commit()
             await self.finish_sync('COMPLETED', f'Successfully processed {saved_count} {fetch_mode_desc}')
+            
         except KeyboardInterrupt:
             print("\nOperation interrupted by user. Saving progress...")
             try:
@@ -622,6 +838,7 @@ class EmailSyncer:
             except Exception as e:
                 print(f"Error saving progress: {e}")
             raise
+            
         except Exception as e:
             print(f"\nUnexpected error: {e}")
             try:
@@ -633,237 +850,167 @@ class EmailSyncer:
             except Exception as commit_err:
                 print(f"Error saving progress: {commit_err}")
             raise
+            
         finally:
-            self.pbar.n = processed_count
-            self.pbar.refresh()
-            self.pbar.close()
-            print(f"Successfully processed {processed_count} messages")
-            print(f"Saved {saved_count} {fetch_mode_desc} to database")
-            print(f"Skipped {skipped_count} messages")
+            if self.pbar:
+                self.pbar.n = processed_count
+                self.pbar.refresh()
+                self.pbar.close()
+                print(f"Successfully processed {processed_count} messages")
+                print(f"Saved {saved_count} {fetch_mode_desc} to database")
+                print(f"Skipped {skipped_count} messages")
+                
         return processed_count, saved_count, skipped_count
 
-async def fetch_headers_syncer(syncer, uid, mailbox):
-    # Fetch headers for a single UID
-    status, data = await syncer.loop.run_in_executor(
-        None,
-        lambda: syncer.imap.uid('FETCH', uid, '(BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE)])')
-    )
-    if status != 'OK':
-        debug_print(f"Failed to fetch headers for UID {uid}: {status}")
-        syncer.checkpoint.add_failed_uid(uid)
-        return 'fail'
-    header_data = None
-    for item in data:
-        if isinstance(item, tuple) and len(item) > 1:
-            header_data = item[1]
-            break
-    if not header_data:
-        debug_print(f"No header data found for UID {uid}")
-        syncer.checkpoint.add_failed_uid(uid)
-        return 'fail'
-    msg = email.message_from_bytes(header_data if isinstance(header_data, bytes) else header_data.encode('utf-8'))
-    date_str = decode_field(msg.get('Date', ''))
-    iso_date = parse_email_date(date_str)
-    await syncer.db.execute(
-        'INSERT OR REPLACE INTO emails(uid, msg_from, msg_to, msg_cc, subject, msg_date, mailbox) VALUES(?,?,?,?,?,?,?)',
-        (
-            uid,
-            decode_field(msg.get('From', '')),
-            decode_field(msg.get('To', '')),
-            decode_field(msg.get('Cc', '')),
-            decode_field(msg.get('Subject', '')),
-            iso_date,
-            mailbox
-        )
-    )
-    syncer.checkpoint.update_progress(uid)
-    if uid in syncer.failed_uids:
-        syncer.checkpoint.clear_failed_uid(uid)
-    return 'saved'
-
-async def fetch_full_email_syncer(syncer, uid, mailbox):
-    debug_print(f"Fetching full email for UID {uid} in mailbox {mailbox}...")
-    status, data = await syncer.loop.run_in_executor(
-        None,
-        lambda: syncer.imap.uid('FETCH', uid, '(BODY.PEEK[])')
-    )
-    if status != 'OK' or not data:
-        print(f"[ERROR] Failed to fetch UID {uid}: status={status}, data_len={len(data) if data else 0}")
-        syncer.checkpoint.add_failed_uid(uid)
-        return 'fail'
-    debug_print(f"Received data for UID {uid}, processing...")
-    raw_email = None
-    for item in data:
-        if isinstance(item, tuple) and len(item) > 1:
-            raw_email = item[1]
-            break
-    if not raw_email:
-        if syncer.pbar.n < 10:
-            debug_print(f"[DEBUG] No raw email data found for UID {uid} in mailbox {mailbox}. Data: {data}")
-        syncer.checkpoint.add_failed_uid(uid)
-        return 'fail'
-    await syncer.db.execute(
-        'INSERT OR REPLACE INTO full_emails(uid, mailbox, raw_email, fetched_at) VALUES(?,?,?,?)',
-        (uid, mailbox, raw_email, datetime.datetime.now().isoformat())
-    )
-    if syncer.pbar.n < 10:
-        print(f"[DEBUG] Successfully saved full email for UID {uid} in mailbox {mailbox}.")
-    syncer.checkpoint.update_progress(uid)
-    if uid in syncer.failed_uids:
-        syncer.checkpoint.clear_failed_uid(uid)
-    return 'saved'
-
-# Refactored fetch_headers and fetch_full_emails to use EmailSyncer and the above fetch functions
-async def fetch_headers(db, host, user, creds, mailbox='INBOX'):
-    checkpoint = CheckpointManager()
-    loop = asyncio.get_event_loop()
-    imap = await loop.run_in_executor(
-        None, 
-        lambda: imap_oauth2_login(host, user, creds.token)
-    )
+async def sync_email_headers(db_manager, imap_client, mailbox='INBOX'):
+    """Synchronize email headers from IMAP server to database"""
+    # Create syncer instance
+    syncer = EmailSyncer(db_manager, imap_client, 'headers')
+    
+    # Start sync operation
+    await syncer.start_sync(mailbox, f'Starting headers sync for {mailbox}')
+    
     try:
-        checkpoint.mark_start(mailbox)
-        await db.execute('''
-            INSERT INTO sync_status (start_time, status, message)
-            VALUES (?, 'STARTED', 'Starting sync operation')
-        ''', (datetime.datetime.now().isoformat(),))
-        async with db.execute('SELECT last_insert_rowid()') as cursor:
-            row = await cursor.fetchone()
-            last_status_id = row[0] if row else None
-        status, data = await loop.run_in_executor(None, lambda: imap.select(mailbox, readonly=True))
-        if status != 'OK':
-            sys.exit(f"Failed to select mailbox: {status}")
-        last_uid_checkpoint = checkpoint.get_last_uid()
-        async with db.execute("SELECT MAX(CAST(uid AS INTEGER)) FROM emails") as cursor:
+        # Select mailbox
+        if not await imap_client.select_mailbox(mailbox):
+            await syncer.finish_sync('ERROR', f'Failed to select mailbox {mailbox}')
+            return
+            
+        # Get the last processed UID from checkpoint
+        last_uid = syncer.checkpoint.get_last_uid()
+        
+        # Check if we have a last UID in the database
+        async with db_manager.db.execute("SELECT MAX(CAST(uid AS INTEGER)) FROM emails WHERE mailbox = ?", (mailbox,)) as cursor:
             row = await cursor.fetchone()
         last_uid_db = int(row[0]) if row and row[0] else 0
-        if last_uid_checkpoint > 0 and last_uid_db > 0:
-            last_uid = min(last_uid_checkpoint, last_uid_db)
+        
+        # Use the minimum of the two to ensure we don't miss any emails
+        if last_uid > 0 and last_uid_db > 0:
+            last_uid = min(last_uid, last_uid_db)
         else:
-            last_uid = max(last_uid_checkpoint, last_uid_db)
+            last_uid = max(last_uid, last_uid_db)
+            
         print(f"Resuming from UID > {last_uid}")
-        failed_uids = checkpoint.get_failed_uids()
+        
+        # Get failed UIDs that need to be retried
+        failed_uids = syncer.checkpoint.get_failed_uids()
         if failed_uids:
             print(f"Found {len(failed_uids)} failed UIDs from previous runs. Will retry these.")
-        status, data = await loop.run_in_executor(None, lambda: imap.uid('SEARCH', None, 'ALL'))
-        if status != 'OK':
-            sys.exit(f"Failed to search mailbox: {status}")
-        uid_list = data[0].decode().split() if isinstance(data[0], bytes) else data[0].split()
-        all_uids = list(map(str, uid_list))
+            
+        # Search for all UIDs in the mailbox
+        all_uids = await imap_client.search_all()
+        if not all_uids:
+            print("No emails found in mailbox.")
+            await syncer.finish_sync('COMPLETED', 'No emails found in mailbox')
+            return
+            
+        # Filter for new UIDs (greater than the last processed UID)
         new_uids = [uid for uid in all_uids if int(uid) > last_uid]
+        
+        # Add failed UIDs to be retried
         if failed_uids:
-            failed_uids_int = [str(uid) for uid in failed_uids]
-            retry_uids = [uid for uid in failed_uids_int if uid in all_uids]
+            failed_uids_str = [str(uid) for uid in failed_uids]
+            retry_uids = [uid for uid in failed_uids_str if uid in all_uids]
             retry_uids = [uid for uid in retry_uids if uid not in new_uids]
             new_uids.extend(retry_uids)
             new_uids.sort(key=int)
+            
         if not new_uids:
             print('No new messages to fetch.')
-            checkpoint.mark_complete()
-            await db.execute(f"UPDATE sync_status SET end_time = ?, status = ?, message = ? WHERE id = ?", 
-                          (datetime.datetime.now().isoformat(), 'COMPLETED', 'No new messages to fetch', last_status_id))
-            await db.commit()
+            await syncer.finish_sync('COMPLETED', 'No new messages to fetch')
             return
+            
+        # Process the UIDs
         total_count = len(new_uids)
-        await EmailSyncer(db, host, user, creds, mailbox, 'headers', fetch_headers_syncer).run([(uid, mailbox) for uid in new_uids], total_count, 'headers')
+        print(f"Found {total_count} new emails to process")
+        
+        # Run the syncer
+        await syncer.run([(uid, mailbox) for uid in new_uids], total_count, 'headers')
+        
     except Exception as e:
-        print(f"Error in fetch_headers: {e}")
-        try:
-            await db.commit()
-            await db.execute(f"UPDATE sync_status SET end_time = ?, status = ?, message = ? WHERE id = ?", 
-                         (datetime.datetime.now().isoformat(), 'ERROR', str(e)[:200], last_status_id))
-            await db.commit()
-        except Exception as commit_err:
-            print(f"Error committing to database: {commit_err}")
+        print(f"Error in sync_email_headers: {e}")
+        await syncer.finish_sync('ERROR', str(e)[:200])
         raise
-    finally:
-        try:
-            await loop.run_in_executor(None, lambda: imap.logout())
-        except Exception as e:
-            print(f"Error during logout: {e}")
 
-async def fetch_full_emails(db, host, user, creds, mailbox='INBOX'):
-    checkpoint = CheckpointManager(CHECKPOINT_FULL_PATH)
-    loop = asyncio.get_event_loop()
-    imap = await loop.run_in_executor(
-        None,
-        lambda: imap_oauth2_login(host, user, creds.token)
-    )
+async def sync_full_emails(db_manager, imap_client, mailbox='INBOX'):
+    """Synchronize full email content from IMAP server to database"""
+    # Create syncer instance
+    syncer = EmailSyncer(db_manager, imap_client, 'full')
+    
+    # Start sync operation
+    await syncer.start_sync(mailbox, f'Starting full email sync for {mailbox}')
+    
     try:
-        checkpoint.mark_start(mailbox)
-        await db.execute('''
-            INSERT INTO sync_status (start_time, status, message)
-            VALUES (?, 'STARTED', 'Starting full email sync')
-        ''', (datetime.datetime.now().isoformat(),))
-        async with db.execute('SELECT last_insert_rowid()') as cursor:
-            row = await cursor.fetchone()
-            last_status_id = row[0] if row else None
-        async with db.execute('SELECT uid, mailbox FROM emails WHERE mailbox = ?', (mailbox,)) as cursor:
+        # Get all email UIDs from the headers table for this mailbox
+        async with db_manager.db.execute('SELECT uid, mailbox FROM emails WHERE mailbox = ?', (mailbox,)) as cursor:
             all_rows = await cursor.fetchall()
         all_uids = [(str(row[0]), row[1]) for row in all_rows]
         
         print(f"Found {len(all_uids)} total emails in database for mailbox {mailbox}")
         
-        async with db.execute('SELECT uid FROM full_emails WHERE mailbox = ?', (mailbox,)) as cursor:
+        # Get already fetched UIDs
+        async with db_manager.db.execute('SELECT uid FROM full_emails WHERE mailbox = ?', (mailbox,)) as cursor:
             fetched_rows = await cursor.fetchall()
         fetched_uids = set(str(row[0]) for row in fetched_rows)
         
         print(f"Already fetched {len(fetched_uids)} full emails")
         
-        failed_uids = checkpoint.get_failed_uids()
+        # Get failed UIDs from previous runs
+        failed_uids = syncer.checkpoint.get_failed_uids()
         if failed_uids:
             print(f"Found {len(failed_uids)} failed UIDs from previous full-email fetches. Will retry these.")
-            print(f"First 5 failed UIDs: {failed_uids[:5]}")
+            print(f"First 5 failed UIDs: {failed_uids[:5] if len(failed_uids) > 5 else failed_uids}")
         
+        # Determine which UIDs need to be fetched
         uids_to_fetch = [(uid, mbox) for (uid, mbox) in all_uids if uid not in fetched_uids]
         retry_uids = [(uid, mbox) for (uid, mbox) in all_uids if uid in failed_uids and uid not in fetched_uids]
+        
         print(f"UIDs needing full email fetch: {len(uids_to_fetch)}")
         print(f"Failed UIDs to retry: {len(retry_uids)}")
         
+        # Add retry UIDs if they're not already in the fetch list
         for item in retry_uids:
             if item not in uids_to_fetch:
                 uids_to_fetch.append(item)
+                
         total_count = len(uids_to_fetch)
         print(f"Total UIDs to fetch: {total_count}")
         
         if not uids_to_fetch:
-            checkpoint.mark_complete()
-            await db.execute(f"UPDATE sync_status SET end_time = ?, status = ?, message = ? WHERE id = ?", 
-                          (datetime.datetime.now().isoformat(), 'COMPLETED', 'No new full emails to fetch', last_status_id))
-            await db.commit()
+            print('No new full emails to fetch.')
+            await syncer.finish_sync('COMPLETED', 'No new full emails to fetch')
             return
             
         # Sample a few UIDs for debugging
         if len(uids_to_fetch) > 0:
             print(f"Sample UIDs to fetch (first 5): {uids_to_fetch[:5]}")
         
-        # Limit number of UIDs to fetch for debugging if needed
+        # Limit number of UIDs for debugging if needed
         if DEBUG and total_count > 100:
             print(f"DEBUG mode: Limiting to first 100 UIDs for testing")
             uids_to_fetch = uids_to_fetch[:100]
             total_count = len(uids_to_fetch)
-
-        syncer = EmailSyncer(db, host, user, creds, mailbox, 'full', fetch_full_email_syncer)
-        await syncer.connect()
+            
+        # Run the syncer
         await syncer.run(uids_to_fetch, total_count, 'full emails')
+        
     except Exception as e:
-        print(f"Error in fetch_full_emails: {e}")
-        try:
-            await db.commit()
-            await db.execute(f"UPDATE sync_status SET end_time = ?, status = ?, message = ? WHERE id = ?", 
-                         (datetime.datetime.now().isoformat(), 'ERROR', str(e)[:200], last_status_id))
-            await db.commit()
-        except Exception as commit_err:
-            print(f"Error committing to database: {commit_err}")
+        print(f"Error in sync_full_emails: {e}")
+        await syncer.finish_sync('ERROR', str(e)[:200])
         raise
-    finally:
-        try:
-            await loop.run_in_executor(None, lambda: imap.logout())
-        except Exception as e:
-            print(f"Error during logout: {e}")
+
+async def display_mailboxes(imap_client):
+    """Display available mailboxes"""
+    mailboxes = await imap_client.list_mailboxes()
+    
+    print("\nAvailable mailboxes:")
+    print("--------------------")
+    for i, mailbox in enumerate(mailboxes, 1):
+        print(f"{i}. {mailbox}")
+    print("\nUse any of these names with the --mailbox argument")
 
 async def main():
-    parser = argparse.ArgumentParser(description='Fetch Gmail headers to SQLite using OAuth2')
+    parser = argparse.ArgumentParser(description='Fetch Gmail emails to SQLite using OAuth2')
     parser.add_argument('--db', default='emails.db', help='Path to SQLite database')
     parser.add_argument('--creds', required=True, help='Path to OAuth2 client secrets JSON')
     parser.add_argument('--host', default='imap.gmail.com', help='IMAP host')
@@ -877,20 +1024,35 @@ async def main():
     global DEBUG
     DEBUG = args.debug or DEBUG
 
+    # Get OAuth2 credentials
     creds = get_credentials(args.creds)
     
-    # If the user wants to list mailboxes, do that and exit
-    if args.list_mailboxes:
-        await list_mailboxes(args.host, args.user, creds)
-        return
+    # Create database manager
+    db_manager = DatabaseManager(args.db)
+    db = await db_manager.connect()
     
-    async with aiosqlite.connect(args.db) as db:
-        await setup_schema(db)
+    try:
+        # Create IMAP client
+        imap_client = ImapClient(args.host, args.user, creds)
+        await imap_client.connect()
+        
+        # If the user wants to list mailboxes, do that and exit
+        if args.list_mailboxes:
+            await display_mailboxes(imap_client)
+            return
+        
+        # Sync emails based on mode
         if args.mode == 'headers':
-            await fetch_headers(db, args.host, args.user, creds, args.mailbox)
+            await sync_email_headers(db_manager, imap_client, args.mailbox)
         elif args.mode == 'full':
-            await fetch_full_emails(db, args.host, args.user, creds, args.mailbox)
-    print('Done.')
+            await sync_full_emails(db_manager, imap_client, args.mailbox)
+        
+        print('Done.')
+    finally:
+        # Close connections
+        if 'imap_client' in locals():
+            await imap_client.close()
+        await db_manager.close()
 
 if __name__ == '__main__':
     try:

@@ -1,6 +1,10 @@
 # SyncEmMail
 
-A Python tool to efficiently sync Gmail email headers to a local SQLite database using OAuth 2.0 authentication.
+A Python tool to efficiently sync Gmail email headers to a local SQLite database using OAuth 2.0 authentication. But before you go...
+
+## Responsible AI usage
+
+This project is yet another product of AI-assisted development (or as the hipsters call it, "Vibe Coding"). I needed a quick solution and let an LLM do the heavy lifting. While it (seemingly) works, the code quality might make your eyes water (and I've seen some pretty gnarly code in my time). Consider this your official warning: proceed with caution and maybe keep a bot^H^H^H some eye drops handy.
 
 ## Features
 
