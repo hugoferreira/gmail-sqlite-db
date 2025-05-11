@@ -18,6 +18,12 @@ This project is yet another product of AI-assisted development (or as the hipste
 - **SQLite Storage**: Fast, portable database that requires no separate server
 - **Query Mode**: Built-in analytical queries for exploring your email data
 - **Smart Schema Migration**: Automatically updates database schema when needed
+- **Attachments Extraction**: Extract, normalize, and deduplicate email attachments
+- **Attachment Deduplication**: Store each unique attachment only once using SHA-256 hashing
+- **Date-Based Chunking**: Smart handling of very large mailboxes like "[Gmail]/All Mail"
+- **Mailbox-Specific Tracking**: Maintain separate sync state for each mailbox
+- **Multi-Mailbox Sync**: Sync all available mailboxes in one command
+- **Analytics Visualizations**: Text-based charts and calendar heatmaps for email data
 
 ## Requirements
 
@@ -28,6 +34,7 @@ This project is yet another product of AI-assisted development (or as the hipste
   - google-auth, google-auth-oauthlib: OAuth2 authentication with Google
   - tqdm: Progress bars for sync operations
   - tabulate: Formatted table output for query results
+  - termgraph: Text-based visualizations for analytics mode
 
 ## Installation
 
@@ -73,6 +80,7 @@ uv run --active main.py --db ./mail.sqlite3 --creds creds.json --user your.email
 - `--host`: IMAP host (default: `imap.gmail.com`)
 - `--user`: Gmail address (**required only for sync modes**)
 - `--mailbox`: Mailbox name (default: `INBOX`)
+- `--all-mailboxes`: Sync all available mailboxes (for `headers`, `full`, and `attachments` modes)
 - `--debug`: Enable debug mode
 - `--list-mailboxes`: List available mailboxes and exit
 - `--mode`: Execution mode: `headers` (default), `full` (fetch full emails), `attachments` (extract and normalize attachments), `analytics` (run analytics), or `query` (run queries)
@@ -88,6 +96,12 @@ To sync only email headers (default mode):
 uv run --active main.py --creds creds.json --user your.email@gmail.com
 ```
 
+To sync headers from all mailboxes:
+
+```
+uv run --active main.py --creds creds.json --user your.email@gmail.com --all-mailboxes
+```
+
 ### Syncing Full Emails
 
 To download complete emails including attachments:
@@ -97,6 +111,26 @@ uv run --active main.py --mode full --creds creds.json --user your.email@gmail.c
 ```
 
 Note: Always sync headers first before syncing full emails.
+
+### Extracting and Normalizing Attachments
+
+After syncing full emails, you can extract and normalize attachments:
+
+```
+uv run --active main.py --mode attachments --db ./mail.sqlite3
+```
+
+This will:
+- Extract all attachments from the full emails
+- Store unique attachments only once (deduplication via SHA-256 hashing)
+- Create normalized tables relating emails to attachments
+- Show statistics about attachment deduplication
+
+For all mailboxes:
+
+```
+uv run --active main.py --mode attachments --db ./mail.sqlite3 --all-mailboxes
+```
 
 ### Listing Available Mailboxes
 
@@ -225,7 +259,7 @@ The following parameters can be used to customize queries:
 
 ## Database Schema
 
-The SQLite database contains three main tables:
+The SQLite database contains the following main tables:
 
 1. `emails` - Stores email metadata:
    - `uid` - Email UID (primary key)
@@ -257,6 +291,51 @@ The SQLite database contains three main tables:
    - `end_time` - When sync completed
    - `status` - Current status (STARTED, COMPLETED, ERROR, INTERRUPTED)
    - `message` - Additional status information
+
+4. `attachment_blobs` - Stores unique attachment content:
+   - `sha256` - SHA-256 hash of the content (primary key)
+   - `content` - Binary content of the attachment (BLOB)
+   - `size` - Size of the attachment in bytes
+   - `fetched_at` - Timestamp when attachment was extracted
+
+5. `email_attachments` - Maps emails to attachments:
+   - `id` - Primary key
+   - `uid` - Email UID (references emails table)
+   - `mailbox` - Mailbox name
+   - `sha256` - SHA-256 hash (references attachment_blobs table)
+   - `filename` - Original filename of the attachment
+   - `fetched_at` - Timestamp when mapping was created
+
+6. `attachment_info` - A view joining email_attachments with emails and attachment_blobs:
+   - Provides a unified view of attachments with email metadata
+   - Includes sender, recipient, subject, date, filename, size, etc.
+
+## Checkpoint System
+
+The tool uses a sophisticated checkpoint system to track progress:
+
+- **Mailbox-specific tracking**: Each mailbox has its own independent sync state
+- **Resumable operations**: The tool can resume from where it left off for each mailbox
+- **Failed email tracking**: UIDs that failed to sync are retried in subsequent runs
+- **Progress persistence**: Checkpoint files save the state between runs
+
+## Handling Large Mailboxes
+
+The tool has special handling for very large mailboxes like "[Gmail]/All Mail":
+
+- **Date-based chunking**: Breaks down searches into monthly chunks to avoid IMAP response size limits
+- **Sequence-based chunking**: Alternative approach that fetches emails in small batches
+- **Error resilience**: Can continue even if individual chunks fail
+- **Progress tracking**: Shows detailed progress during large mailbox operations
+
+## Attachment Deduplication
+
+The tool implements efficient attachment storage:
+
+- **Content-based deduplication**: Uses SHA-256 hashing to identify identical attachments
+- **Storage efficiency**: Each unique attachment is stored only once
+- **Normalized schema**: Maintains the relationship between emails and attachments
+- **Statistics reporting**: Shows deduplication ratio and storage savings
 
 ## Useful SQLite Queries
 
@@ -378,6 +457,54 @@ JOIN emails e ON t.uid = e.uid AND t.mailbox = e.mailbox
 ORDER BY e.msg_date;
 ```
 
+### Queries Using the Attachment Tables
+
+#### Find Duplicate Attachments
+
+```sql
+SELECT sha256, COUNT(*) as occurrences
+FROM email_attachments
+GROUP BY sha256
+HAVING COUNT(*) > 1
+ORDER BY occurrences DESC;
+```
+
+#### Find Largest Attachments
+
+```sql
+SELECT e.subject, ea.filename, ab.size/1024/1024 as size_mb, e.msg_date
+FROM attachment_info ai
+JOIN emails e ON ai.uid = e.uid AND ai.mailbox = e.mailbox
+JOIN email_attachments ea ON ai.id = ea.id
+JOIN attachment_blobs ab ON ea.sha256 = ab.sha256
+ORDER BY ab.size DESC
+LIMIT 20;
+```
+
+#### Find Emails with PDF Attachments
+
+```sql
+SELECT e.subject, e.msg_from, e.msg_date, ea.filename
+FROM email_attachments ea
+JOIN emails e ON ea.uid = e.uid AND ea.mailbox = e.mailbox
+WHERE ea.filename LIKE '%.pdf'
+ORDER BY e.msg_date DESC;
+```
+
+#### Find Attachments by File Extension
+
+```sql
+SELECT 
+  LOWER(SUBSTR(filename, INSTR(filename, '.', -1) + 1)) as extension,
+  COUNT(*) as count,
+  SUM(ab.size)/1024/1024 as total_size_mb
+FROM email_attachments ea
+JOIN attachment_blobs ab ON ea.sha256 = ab.sha256
+WHERE INSTR(filename, '.') > 0
+GROUP BY extension
+ORDER BY count DESC;
+```
+
 ## Troubleshooting
 
 ### Running with uv
@@ -404,6 +531,10 @@ ORDER BY e.msg_date;
 
 - **Connection Timeout**: Check your internet connection or try again later
 - **Rate Limiting**: Gmail has rate limits - the tool applies small delays but might still hit limits with large mailboxes
+- **Large Mailbox Issues**: For problems with "[Gmail]/All Mail":
+  - The tool uses special date-based chunking for this mailbox
+  - If you encounter "Could not parse command" errors, try using a specific mailbox instead
+  - You can reduce chunk size by modifying the code if needed
 
 ## How It Works
 
@@ -414,6 +545,8 @@ ORDER BY e.msg_date;
 5. Headers are parsed and stored in the SQLite database
 6. (Optional) Full email content can be downloaded in a second pass
 7. Progress is saved in checkpoints for resumable operation
+8. Attachments can be extracted and normalized with deduplication
+9. Analytics can be generated from the email and attachment data
 
 ## License
 
