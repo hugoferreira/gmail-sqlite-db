@@ -20,6 +20,7 @@ from tqdm import tqdm
 import tabulate
 import subprocess
 import shutil
+import hashlib
 
 # OAuth2 setup
 SCOPES = ['https://mail.google.com/']
@@ -288,14 +289,26 @@ def debug_print(*args, **kwargs):
 
 # Unified checkpoint system
 class CheckpointManager:
-    def __init__(self, mode='headers'):
+    def __init__(self, mode='headers', mailbox=None):
         """Initialize checkpoint manager with a specific mode
         
         Args:
             mode: Sync mode - 'headers' or 'full'
+            mailbox: Current mailbox name - used for mailbox-specific state
         """
+        self.mode = mode
+        self.mailbox = mailbox if mailbox else 'INBOX'
         self.checkpoint_path = f'checkpoint_{mode}.json'
         self.state = self._load_state()
+        
+        # Initialize mailbox state if it doesn't exist
+        if self.mailbox not in self.state:
+            self.state[self.mailbox] = {
+                'last_uid': 0,        # Last successfully processed UID
+                'failed_uids': [],    # UIDs that failed to process
+                'in_progress': False, # Whether a sync was interrupted
+                'timestamp': None     # Last sync timestamp
+            }
         
     def _load_state(self):
         """Load checkpoint state from file if it exists"""
@@ -307,68 +320,72 @@ class CheckpointManager:
                 print(f"Error loading checkpoint state: {e}")
         
         # Default state if no checkpoint file exists or loading fails
-        return {
-            'last_uid': 0,        # Last successfully processed UID
-            'failed_uids': [],    # UIDs that failed to process
-            'in_progress': False, # Whether a sync was interrupted
-            'mailbox': None,      # Last mailbox being processed
-            'timestamp': None     # Last sync timestamp
-        }
+        return {}
     
     def save_state(self):
         """Save current state to checkpoint file"""
-        self.state['timestamp'] = datetime.datetime.now().isoformat()
+        self.state[self.mailbox]['timestamp'] = datetime.datetime.now().isoformat()
         try:
             with open(self.checkpoint_path, 'w') as f:
                 json.dump(self.state, f, indent=2)
         except Exception as e:
             print(f"Error saving checkpoint state: {e}")
     
-    def mark_start(self, mailbox):
+    def set_mailbox(self, mailbox):
+        """Set current mailbox and initialize state if needed"""
+        self.mailbox = mailbox if mailbox else 'INBOX'
+        if self.mailbox not in self.state:
+            self.state[self.mailbox] = {
+                'last_uid': 0,
+                'failed_uids': [],
+                'in_progress': False,
+                'timestamp': None
+            }
+
+    def mark_start(self):
         """Mark the start of a sync operation"""
-        self.state['in_progress'] = True
-        self.state['mailbox'] = mailbox
+        self.state[self.mailbox]['in_progress'] = True
         self.save_state()
     
     def mark_complete(self):
         """Mark the completion of a sync operation"""
-        self.state['in_progress'] = False
+        self.state[self.mailbox]['in_progress'] = False
         self.save_state()
     
     def update_progress(self, uid):
         """Update the last processed UID"""
         # Only update if this UID is greater than the last one
         uid_int = int(uid)
-        if uid_int > self.state['last_uid']:
-            self.state['last_uid'] = uid_int
+        if uid_int > self.state[self.mailbox]['last_uid']:
+            self.state[self.mailbox]['last_uid'] = uid_int
             # Only save periodically to avoid excessive disk writes
             if uid_int % 100 == 0:  # Save more frequently (was 500)
                 self.save_state()
     
     def add_failed_uid(self, uid):
         """Add a UID to the failed list"""
-        if uid not in self.state['failed_uids']:
-            self.state['failed_uids'].append(uid)
+        if uid not in self.state[self.mailbox]['failed_uids']:
+            self.state[self.mailbox]['failed_uids'].append(uid)
             # Only save periodically to avoid excessive disk writes
-            if len(self.state['failed_uids']) % 100 == 0:
+            if len(self.state[self.mailbox]['failed_uids']) % 100 == 0:
                 self.save_state()
     
     def get_last_uid(self):
         """Get the last successfully processed UID"""
-        return self.state['last_uid']
+        return self.state[self.mailbox]['last_uid']
     
     def get_failed_uids(self):
         """Get the list of failed UIDs"""
-        return self.state['failed_uids']
+        return self.state[self.mailbox]['failed_uids']
     
     def clear_failed_uid(self, uid):
         """Remove a UID from the failed list if it's been processed successfully"""
-        if uid in self.state['failed_uids']:
-            self.state['failed_uids'].remove(uid)
+        if uid in self.state[self.mailbox]['failed_uids']:
+            self.state[self.mailbox]['failed_uids'].remove(uid)
             
     def was_interrupted(self):
         """Check if a previous sync was interrupted"""
-        return self.state['in_progress']
+        return self.state[self.mailbox]['in_progress']
 
 # Database connection manager
 class DatabaseManager:
@@ -665,7 +682,7 @@ class DatabaseManager:
             row = await cursor.fetchone()
             return row[0] if row else None
             
-    async def log_sync_finish(self, status_id, status, message):
+    async def log_sync_end(self, status_id, status, message):
         """Log the completion of a sync operation"""
         await self.db.execute(
             "UPDATE sync_status SET end_time = ?, status = ?, message = ? WHERE id = ?", 
@@ -699,13 +716,22 @@ class ImapClient:
         imap.authenticate('XOAUTH2', lambda x: auth_string)
         return imap
         
+    def _quote_mailbox_if_needed(self, mailbox):
+        """Add double quotes around mailbox names that contain spaces or slashes"""
+        if not (mailbox.startswith('"') and mailbox.endswith('"')):
+            if " " in mailbox or "/" in mailbox:
+                return f'"{mailbox}"'
+        return mailbox
+        
     async def select_mailbox(self, mailbox, readonly=True):
         """Select a mailbox"""
         if self.current_mailbox == mailbox:
             return True
             
+        quoted_mailbox = self._quote_mailbox_if_needed(mailbox)
+            
         status, _ = await self.loop.run_in_executor(
-            None, lambda: self.imap.select(mailbox, readonly=readonly)
+            None, lambda: self.imap.select(quoted_mailbox, readonly=readonly)
         )
         if status == 'OK':
             self.current_mailbox = mailbox
@@ -737,6 +763,137 @@ class ImapClient:
             
         uid_list = data[0].decode().split() if isinstance(data[0], bytes) else data[0].split()
         return list(map(str, uid_list))
+        
+    async def search_chunked(self, chunk_size=10000):
+        """Search for messages in chunks to avoid response size limits
+        
+        This method fetches UIDs in chunks by date ranges to avoid hitting
+        Gmail's 1MB response size limit.
+        """
+        try:
+            # First try to get message count
+            status, data = await self.loop.run_in_executor(
+                None, lambda: self.imap.status(self.current_mailbox, '(MESSAGES)')
+            )
+            
+            if status != 'OK':
+                print(f"Warning: Could not get message count for {self.current_mailbox}")
+                # Fall back to normal search but with a smaller limit
+                return await self.search_all()
+            
+            # Parse the message count
+            match = re.search(r'MESSAGES\s+(\d+)', data[0].decode())
+            if not match:
+                print(f"Warning: Could not parse message count for {self.current_mailbox}")
+                return await self.search_all()
+                
+            message_count = int(match.group(1))
+            
+            if message_count < chunk_size:
+                # If we have fewer messages than the chunk size, just use search_all
+                return await self.search_all()
+            
+            print(f"Large mailbox detected ({message_count} messages). Using chunked fetch.")
+            
+            # For large mailboxes like [Gmail]/All Mail, fetch UIDs in chunks
+            all_uids = []
+            
+            # Get the UIDs in sequence number chunks to avoid response size limits
+            for start in range(1, message_count + 1, chunk_size):
+                end = min(start + chunk_size - 1, message_count)
+                sequence_set = f"{start}:{end}"
+                
+                status, data = await self.loop.run_in_executor(
+                    None, lambda: self.imap.fetch(sequence_set, '(UID)')
+                )
+                
+                if status != 'OK':
+                    print(f"Warning: Failed to fetch UIDs for chunk {start}-{end}")
+                    continue
+                
+                # Extract UIDs from the response
+                for item in data:
+                    if isinstance(item, tuple) and len(item) == 2:
+                        match = re.search(r'UID\s+(\d+)', item[0].decode())
+                        if match:
+                            all_uids.append(match.group(1))
+            
+            return all_uids
+        except Exception as e:
+            print(f"Error in search_chunked: {e}")
+            # Fall back to normal search
+            return await self.search_all()
+
+    async def search_by_date_chunks(self, start_year=None, end_year=None):
+        """Search for messages by date range chunks
+        
+        This method is specifically designed for extremely large mailboxes
+        like [Gmail]/All Mail where other methods fail due to size limitations.
+        It breaks down the search into year-month chunks.
+        """
+        try:
+            # Determine date range to search
+            if not start_year:
+                # Start from a reasonable point in the past if not specified
+                start_year = 2004  # Gmail launched in 2004
+            
+            if not end_year:
+                # Default to current year if not specified
+                end_year = datetime.datetime.now().year
+                
+            print(f"Searching emails from {start_year} to {end_year} in date chunks...")
+            
+            all_uids = []
+            total_chunks = (end_year - start_year + 1) * 12
+            current_chunk = 0
+            
+            # Search by year and month to avoid large responses
+            for year in range(start_year, end_year + 1):
+                for month in range(1, 13):
+                    current_chunk += 1
+                    
+                    # Skip future months in current year
+                    if year == end_year and month > datetime.datetime.now().month:
+                        continue
+                        
+                    # Format date criteria for IMAP
+                    # IMAP search date format is DD-MMM-YYYY
+                    date_start = f"01-{['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][month-1]}-{year}"
+                    
+                    # Last day of month (account for leap years)
+                    last_day = 31
+                    if month in [4, 6, 9, 11]:
+                        last_day = 30
+                    elif month == 2:  # February
+                        last_day = 29 if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 28
+                        
+                    date_end = f"{last_day}-{['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][month-1]}-{year}"
+                    
+                    print(f"Searching chunk {current_chunk}/{total_chunks}: {date_start} to {date_end}")
+                    
+                    try:
+                        # Search with date range
+                        status, data = await self.loop.run_in_executor(
+                            None, lambda: self.imap.uid('SEARCH', None, f'(SINCE "{date_start}" BEFORE "{date_end}")')
+                        )
+                        
+                        if status != 'OK':
+                            print(f"Warning: Failed to search date range {date_start} to {date_end}")
+                            continue
+                            
+                        uids = data[0].decode().split() if isinstance(data[0], bytes) else data[0].split()
+                        if uids and len(uids) > 0:
+                            all_uids.extend(uids)
+                            print(f"  Found {len(uids)} messages for {['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][month-1]} {year}")
+                    except Exception as e:
+                        print(f"Error searching {date_start} to {date_end}: {e}")
+                        # Continue to next chunk, don't let one failed chunk stop the whole process
+                        continue
+            
+            return all_uids
+        except Exception as e:
+            print(f"Error in search_by_date_chunks: {e}")
+            return []
         
     async def list_mailboxes(self):
         """List all available mailboxes"""
@@ -897,32 +1054,33 @@ def parse_imap_response(data):
 
 # Email processor class for fetching and syncing emails
 class EmailSyncer:
-    def __init__(self, db_manager, imap_client, mode='headers'):
+    def __init__(self, db_manager, imap_client, mode='headers', mailbox=None):
         """Initialize the EmailSyncer
         
         Args:
             db_manager: DatabaseManager instance
             imap_client: ImapClient instance
             mode: 'headers' or 'full'
+            mailbox: Current mailbox name
         """
         self.db = db_manager.db
         self.db_manager = db_manager
         self.imap_client = imap_client
         self.mode = mode
-        self.checkpoint = CheckpointManager(mode)
+        self.checkpoint = CheckpointManager(mode, mailbox)
         self.last_status_id = None
         self.failed_uids = self.checkpoint.get_failed_uids()
         self.emails_since_commit = 0
         self.pbar = None
 
-    async def start_sync(self, mailbox, message):
+    async def start_sync(self, message):
         """Start sync operation and log it"""
-        self.checkpoint.mark_start(mailbox)
+        self.checkpoint.mark_start()
         self.last_status_id = await self.db_manager.log_sync_start(message)
         
     async def finish_sync(self, status, message):
         """Finish sync operation and log it"""
-        await self.db_manager.log_sync_finish(self.last_status_id, status, message)
+        await self.db_manager.log_sync_end(self.last_status_id, status, message)
         self.checkpoint.mark_complete()
         
     async def process_headers(self, uid, mailbox):
@@ -1123,10 +1281,10 @@ class EmailSyncer:
 async def sync_email_headers(db_manager, imap_client, mailbox='INBOX'):
     """Synchronize email headers from IMAP server to database"""
     # Create syncer instance
-    syncer = EmailSyncer(db_manager, imap_client, 'headers')
+    syncer = EmailSyncer(db_manager, imap_client, 'headers', mailbox)
     
     # Start sync operation
-    await syncer.start_sync(mailbox, f'Starting headers sync for {mailbox}')
+    await syncer.start_sync(f'Starting headers sync for {mailbox}')
     
     try:
         # Select mailbox
@@ -1155,8 +1313,20 @@ async def sync_email_headers(db_manager, imap_client, mailbox='INBOX'):
         if failed_uids:
             print(f"Found {len(failed_uids)} failed UIDs from previous runs. Will retry these.")
             
-        # Search for all UIDs in the mailbox
-        all_uids = await imap_client.search_all()
+        # For the exceptionally large "[Gmail]/All Mail" mailbox, use date-based search
+        if mailbox == '[Gmail]/All Mail':
+            print("Using date-based search for [Gmail]/All Mail mailbox")
+            all_uids = await imap_client.search_by_date_chunks(start_year=2000)
+        # For other large mailboxes, use chunked search
+        elif mailbox in ['[Gmail]/Mail'] or 'All Mail' in mailbox:
+            try:
+                all_uids = await imap_client.search_chunked()
+            except Exception as e:
+                print(f"Chunked search failed: {e}. Falling back to date-based search.")
+                all_uids = await imap_client.search_by_date_chunks(start_year=2000)
+        else:
+            all_uids = await imap_client.search_all()
+            
         if not all_uids:
             print("No emails found in mailbox.")
             await syncer.finish_sync('COMPLETED', 'No emails found in mailbox')
@@ -1193,10 +1363,10 @@ async def sync_email_headers(db_manager, imap_client, mailbox='INBOX'):
 async def sync_full_emails(db_manager, imap_client, mailbox='INBOX'):
     """Synchronize full email content from IMAP server to database"""
     # Create syncer instance
-    syncer = EmailSyncer(db_manager, imap_client, 'full')
+    syncer = EmailSyncer(db_manager, imap_client, 'full', mailbox)
     
     # Start sync operation
-    await syncer.start_sync(mailbox, f'Starting full email sync for {mailbox}')
+    await syncer.start_sync(f'Starting full email sync for {mailbox}')
     
     try:
         # Get all email UIDs from the headers table for this mailbox
@@ -1342,72 +1512,142 @@ async def sync_attachments(db_manager, mailbox='INBOX'):
     from email import policy
     import hashlib
 
+    # Create a checkpoint manager for tracking progress
+    checkpoint = CheckpointManager('attachments', mailbox)
+    checkpoint.mark_start()
+
+    # Log start of sync
+    sync_status_id = await db_manager.log_sync_start(f'Starting attachments extraction for {mailbox}')
+
     # Create normalized tables
     await db_manager.db.execute('''
         CREATE TABLE IF NOT EXISTS attachment_blobs (
             sha256 TEXT PRIMARY KEY,
-            content BLOB,
-            size INTEGER
+            content BLOB NOT NULL,
+            size INTEGER NOT NULL,
+            fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
     await db_manager.db.execute('''
         CREATE TABLE IF NOT EXISTS email_attachments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            uid TEXT,
-            mailbox TEXT,
-            sha256 TEXT,
+            uid TEXT NOT NULL,
+            mailbox TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
             filename TEXT,
-            fetched_at TEXT,
-            FOREIGN KEY(sha256) REFERENCES attachment_blobs(sha256)
+            fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (sha256) REFERENCES attachment_blobs(sha256),
+            UNIQUE(uid, mailbox, sha256, filename)
         )
     ''')
+
+    # Create indexes
     await db_manager.db.execute('CREATE INDEX IF NOT EXISTS idx_email_attachments_uid_mailbox ON email_attachments(uid, mailbox)')
     await db_manager.db.execute('CREATE INDEX IF NOT EXISTS idx_email_attachments_sha256 ON email_attachments(sha256)')
-    await db_manager.db.execute('CREATE INDEX IF NOT EXISTS idx_email_attachments_filename ON email_attachments(filename)')
-    await db_manager.db.commit()
+    await db_manager.db.execute('CREATE INDEX IF NOT EXISTS idx_attachment_blobs_size ON attachment_blobs(size)')
 
     # Create a view for easy querying
     await db_manager.db.execute('''
         CREATE VIEW IF NOT EXISTS attachment_info AS
-        SELECT ea.id, ea.uid, ea.mailbox, e.subject, ea.filename, ab.size, ab.sha256, ea.fetched_at
-        FROM email_attachments ea
-        LEFT JOIN emails e ON ea.uid = e.uid AND ea.mailbox = e.mailbox
-        LEFT JOIN attachment_blobs ab ON ea.sha256 = ab.sha256
+        SELECT 
+            ea.id, 
+            ea.uid, 
+            ea.mailbox, 
+            ea.filename, 
+            ab.size, 
+            ab.sha256,
+            ea.fetched_at,
+            e.msg_date,
+            e.msg_from,
+            e.msg_to,
+            e.subject
+        FROM 
+            email_attachments ea
+        JOIN 
+            attachment_blobs ab ON ea.sha256 = ab.sha256
+        JOIN
+            emails e ON ea.uid = e.uid AND ea.mailbox = e.mailbox
     ''')
+    
     await db_manager.db.commit()
+    
+    # Get the last processed UID from checkpoint
+    last_uid = checkpoint.get_last_uid()
+    
+    print(f"Processing attachments for mailbox '{mailbox}', starting from UID > {last_uid}")
 
-    # Get all full_emails for the mailbox
-    async with db_manager.db.execute('SELECT uid, mailbox, raw_email FROM full_emails WHERE mailbox = ?', (mailbox,)) as cursor:
+    # Query to get all emails that have attachments
+    query = '''
+        SELECT uid, mailbox, full_content 
+        FROM full_emails
+        WHERE mailbox = ? AND CAST(uid AS INTEGER) > ?
+        ORDER BY CAST(uid AS INTEGER)
+    '''
+    async with db_manager.db.execute(query, (mailbox, last_uid)) as cursor:
         rows = await cursor.fetchall()
 
-    print(f"Found {len(rows)} full emails in mailbox {mailbox} to scan for attachments.")
-    pbar = tqdm(total=len(rows), desc='Extracting attachments')
+    # Process emails
     count = 0
-    for uid, mbox, raw_email in rows:
+    pbar = tqdm.tqdm(total=len(rows), desc=f"Extracting attachments from {mailbox}")
+    
+    for row in rows:
+        uid, mailbox, content = row
         try:
-            msg = pyemail.message_from_bytes(raw_email, policy=policy.default)
-            for part in msg.walk():
-                content_disposition = part.get_content_disposition()
+            # Parse the email
+            msg = pyemail.message_from_bytes(content, policy=policy.default)
+            
+            # Find attachments
+            for part in msg.iter_attachments():
                 filename = part.get_filename()
-                if content_disposition == 'attachment' or (filename and content_disposition == 'inline'):
-                    payload = part.get_payload(decode=True)
-                    if filename and payload:
-                        size = len(payload)
-                        sha = hashlib.sha256(payload).hexdigest()
-                        # Insert into attachment_blobs if not exists
-                        await db_manager.db.execute(
-                            'INSERT OR IGNORE INTO attachment_blobs (sha256, content, size) VALUES (?, ?, ?)',
-                            (sha, payload, size)
-                        )
-                        # Always insert mapping
-                        await db_manager.db.execute(
-                            'INSERT INTO email_attachments (uid, mailbox, sha256, filename, fetched_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)',
-                            (uid, mbox, sha, filename)
-                        )
-                        count += 1
+                if not filename:
+                    continue
+                    
+                # Get content
+                content = part.get_content()
+                size = len(content)
+                
+                # Skip empty attachments
+                if size == 0:
+                    continue
+                    
+                # Compute SHA-256
+                sha = hashlib.sha256(content).hexdigest()
+                
+                # Try to insert into blob table (will be ignored if exists)
+                try:
+                    await db_manager.db.execute('''
+                        INSERT OR IGNORE INTO attachment_blobs (sha256, content, size)
+                        VALUES (?, ?, ?)
+                    ''', (sha, content, size))
+                except Exception as e:
+                    print(f"Error storing blob {sha}: {e}")
+                    continue
+                
+                # Insert into mapping table
+                try:
+                    await db_manager.db.execute('''
+                        INSERT OR IGNORE INTO email_attachments (uid, mailbox, sha256, filename)
+                        VALUES (?, ?, ?, ?)
+                    ''', (uid, mailbox, sha, filename))
+                    
+                    count += 1
+                    
+                    # Commit every 100 attachments
+                    if count % 100 == 0:
+                        await db_manager.db.commit()
+                        
+                except Exception as e:
+                    print(f"Error mapping attachment {filename} to email {uid}: {e}")
+                    continue
+            
         except Exception as e:
-            print(f"Error processing UID {uid}: {e}")
+            print(f"Error processing email {uid}: {e}")
+            checkpoint.add_failed_uid(uid)
+            continue
+            
         pbar.update(1)
+        
     pbar.close()
     await db_manager.db.commit()
     print(f"Extracted {count} attachments (including duplicates across emails).")
@@ -1420,7 +1660,15 @@ async def sync_attachments(db_manager, mailbox='INBOX'):
     duplicates = total_mappings - unique_attachments
     print(f"Unique attachments: {unique_attachments}")
     print(f"Total email-attachment mappings: {total_mappings}")
-    print(f"Duplicate mappings (attachments appearing in multiple emails): {duplicates}")
+    print(f"Duplicate mappings (same attachment in multiple emails): {duplicates}")
+    
+    if total_mappings > 0:
+        print(f"Deduplication ratio: {duplicates/total_mappings:.1%}")
+        print(f"Storage savings: {duplicates/total_mappings:.1%} of attachment data")
+        
+    # Mark sync as complete
+    checkpoint.mark_complete()
+    await db_manager.log_sync_end(sync_status_id, 'COMPLETED', f"Extracted {count} attachments ({unique_attachments} unique)")
 
 async def analytics_email_density(db_manager, year=None, metric='emails'):
     """Show a monthly density chart for a given year and metric using termgraph."""
@@ -1482,10 +1730,11 @@ async def run_analytics(db_manager, args):
 async def main():
     parser = argparse.ArgumentParser(description='Fetch Gmail emails to SQLite using OAuth2')
     parser.add_argument('--db', default='mail.sqlite3', help='Path to SQLite database')
-    parser.add_argument('--creds', help='Path to OAuth2 client secrets JSON')
+    parser.add_argument('--creds', default="creds.json", help='Path to OAuth2 client secrets JSON')
     parser.add_argument('--host', default='imap.gmail.com', help='IMAP host')
     parser.add_argument('--user', help='Gmail address')
     parser.add_argument('--mailbox', default='INBOX', help='Mailbox name')
+    parser.add_argument('--all-mailboxes', action='store_true', help='Sync all mailboxes (headers, full, attachments modes)')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--list-mailboxes', action='store_true', help='List available mailboxes and exit')
     parser.add_argument('--mode', choices=['headers', 'full', 'query', 'attachments', 'analytics'], default='headers', 
@@ -1568,13 +1817,52 @@ async def main():
         if args.mode == 'headers':
             imap_client = ImapClient(args.host, args.user, creds)
             await imap_client.connect()
-            await sync_email_headers(db_manager, imap_client, args.mailbox)
+            if args.all_mailboxes:
+                mailboxes = await imap_client.list_mailboxes()
+                print('[DEBUG] Mailboxes returned by imap.list_mailboxes():')
+                for mbox in mailboxes:
+                    print(f'  - "{mbox}"')
+                for mailbox in mailboxes:
+                    print(f'[DEBUG] About to select mailbox: "{mailbox}"')
+                    try:
+                        await imap_client.select_mailbox(mailbox)
+                    except Exception as e:
+                        print(f"[WARNING] Skipping mailbox '{mailbox}': {e}")
+                        continue
+                    await sync_email_headers(db_manager, imap_client, mailbox)
+            else:
+                await sync_email_headers(db_manager, imap_client, args.mailbox)
         elif args.mode == 'full':
             imap_client = ImapClient(args.host, args.user, creds)
             await imap_client.connect()
-            await sync_full_emails(db_manager, imap_client, args.mailbox)
+            if args.all_mailboxes:
+                mailboxes = await imap_client.list_mailboxes()
+                print('[DEBUG] Mailboxes returned by imap.list_mailboxes():')
+                for mbox in mailboxes:
+                    print(f'  - "{mbox}"')
+                for mailbox in mailboxes:
+                    print(f'[DEBUG] About to select mailbox: "{mailbox}"')
+                    try:
+                        await imap_client.select_mailbox(mailbox)
+                    except Exception as e:
+                        print(f"[WARNING] Skipping mailbox '{mailbox}': {e}")
+                        continue
+                    await sync_full_emails(db_manager, imap_client, mailbox)
+            else:
+                await sync_full_emails(db_manager, imap_client, args.mailbox)
         elif args.mode == 'attachments':
-            await sync_attachments(db_manager, args.mailbox)
+            if args.all_mailboxes:
+                # For attachments, get mailboxes from full_emails table
+                mailboxes = await db_manager.get_mailboxes_from_full_emails()
+                for mailbox in mailboxes:
+                    try:
+                        # No IMAP select needed, but check if mailbox is valid in DB
+                        await sync_attachments(db_manager, mailbox)
+                    except Exception as e:
+                        print(f"[WARNING] Skipping mailbox '{mailbox}': {e}")
+                        continue
+            else:
+                await sync_attachments(db_manager, args.mailbox)
         elif args.mode == 'analytics':
             await run_analytics(db_manager, args)
         print('Done.')

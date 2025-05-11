@@ -64,16 +64,21 @@ Run the tool with the following command:
 uv run --active main.py --db ./mail.sqlite3 --creds creds.json --user your.email@gmail.com
 ```
 
+> **Note:** The `--creds` and `--user` arguments are only required for sync modes (`headers`, `full`, and `--list-mailboxes`). For analytics, attachments, and query modes, you do **not** need to provide these arguments.
+
 ### Command Line Arguments
 
 - `--db`: Path to SQLite database (default: `emails.db`)
-- `--creds`: Path to OAuth2 client secrets JSON (required for sync modes)
+- `--creds`: Path to OAuth2 client secrets JSON (**required only for sync modes**)
 - `--host`: IMAP host (default: `imap.gmail.com`)
-- `--user`: Gmail address (required for sync modes)
+- `--user`: Gmail address (**required only for sync modes**)
 - `--mailbox`: Mailbox name (default: `INBOX`)
 - `--debug`: Enable debug mode
 - `--list-mailboxes`: List available mailboxes and exit
-- `--mode`: Execution mode: `headers` (default), `full` (fetch full emails), or `query` (run queries)
+- `--mode`: Execution mode: `headers` (default), `full` (fetch full emails), `attachments` (extract and normalize attachments), `analytics` (run analytics), or `query` (run queries)
+- `--year`: Year for analytics (default: current year)
+- `--calendar`: Show calendar heatmap for analytics mode
+- `--metric`: Metric to visualize in analytics mode (see below)
 
 ### Syncing Email Headers
 
@@ -102,6 +107,52 @@ uv run --active main.py --creds creds.json --user your.email@gmail.com --list-ma
 ```
 
 This will display a list of all mailboxes you can access, which you can then use with the `--mailbox` argument to sync emails from a specific mailbox.
+
+### Analytics Mode
+
+The analytics mode allows you to visualize your email and attachment data using text-based charts and heatmaps in the terminal. It uses [termgraph](https://github.com/mkaz/termgraph) for visualization (make sure it is installed).
+
+#### Example Usage
+
+**Monthly email density bar chart:**
+```
+python main.py --mode analytics --db mail.sqlite3 --year 2023
+```
+
+**Calendar heatmap of email activity:**
+```
+python main.py --mode analytics --db mail.sqlite3 --year 2023 --calendar
+```
+
+**Monthly number of attachments:**
+```
+python main.py --mode analytics --db mail.sqlite3 --year 2023 --metric attachments
+```
+
+**Calendar heatmap of total attachment size:**
+```
+python main.py --mode analytics --db mail.sqlite3 --year 2023 --calendar --metric attachment_size
+```
+
+#### Available Metrics
+
+| Metric                | Description                                      |
+|-----------------------|--------------------------------------------------|
+| emails                | Number of emails                                 |
+| attachments           | Number of attachments (by email date)            |
+| attachment_size       | Total attachment size in bytes (by email date)   |
+| unique_attachments    | Unique attachments (by hash, by email date)      |
+| avg_attachment_size   | Average attachment size in bytes (by email date) |
+
+You can use `--metric` with any analytics visualization. The default is `emails`.
+
+#### Requirements
+
+- [termgraph](https://github.com/mkaz/termgraph) must be installed (see requirements.txt).
+
+#### DRY Analytics
+
+The analytics system is DRY: all metrics and visualizations use a unified, maintainable code path. You can easily add new metrics or visualizations.
 
 ### Query Mode
 
@@ -171,35 +222,6 @@ The following parameters can be used to customize queries:
    ```
    uv run --active main.py --mode query --query thread --message-id "<message-id@example.com>"
    ```
-   
-### Extending Query Mode
-
-You can add your own custom queries by modifying the `QUERIES` dictionary in `main.py`. Each query requires the following elements:
-
-```python
-'my_query': {
-    'name': 'My Custom Query',
-    'description': 'What this query does',
-    'query': '''
-        SELECT field1, field2
-        FROM table
-        WHERE condition = ?
-        LIMIT ?;
-    ''',
-    'params': {'param1': default_value, 'limit': 10},
-}
-```
-
-For queries that need to create views or temporary tables, use the `setup` key:
-
-```python
-'setup': '''
-    CREATE VIEW IF NOT EXISTS my_view AS
-    SELECT field1, COUNT(*) as count
-    FROM table
-    GROUP BY field1;
-''',
-```
 
 ## Database Schema
 
