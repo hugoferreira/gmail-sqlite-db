@@ -158,6 +158,12 @@ async def main():
     full_parser = sync_subparsers.add_parser('full', help='Sync full email content (requires headers to be synced first).' , parents=[common_sync_args_parser])
     attachments_parser = sync_subparsers.add_parser('attachments', help='Extract and normalize attachments from synced full emails.', parents=[common_sync_args_parser])
     
+    # --- Serve MCP Command ---
+    serve_mcp_parser = subparsers.add_parser('serve-mcp', help='Start the Model Context Protocol (MCP) server.')
+    serve_mcp_parser.add_argument('--mcp-host', default='0.0.0.0', help='Host for the MCP server (default: 0.0.0.0).')
+    serve_mcp_parser.add_argument('--mcp-port', type=int, default=8001, help='Port for the MCP server (default: 8001).')
+    # Add other MCP server specific configurations here if needed, e.g., path to specific Ollama models if not global
+
     args = parser.parse_args()
 
     if args.debug:
@@ -180,6 +186,13 @@ async def main():
         if not args.user:
             parser.error("the following arguments are required for sync: --user")
         await handle_sync_command(args)
+    elif args.command == 'serve-mcp':
+        # Import uvicorn and the mcp app instance here to avoid circular dependencies
+        # or making uvicorn a top-level import if only used for this command.
+        import uvicorn
+        from fastmcp_server import mcp as mcp_application # Import the app instance
+        print(f"Starting MCP Server on {args.mcp_host}:{args.mcp_port}")
+        uvicorn.run(mcp_application, host=args.mcp_host, port=args.mcp_port, log_level="info")
     else:
         parser.print_help()
 

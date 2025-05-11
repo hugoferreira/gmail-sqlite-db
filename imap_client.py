@@ -188,12 +188,36 @@ class ImapClient:
         for mailbox_entry in mailboxes_data:
             if isinstance(mailbox_entry, bytes):
                 mailbox_entry = mailbox_entry.decode('utf-8', errors='replace')
-            parts = mailbox_entry.split(' "')
-            if len(parts) > 1:
-                name = parts[-1].rstrip('"')
-                result.append(name)
-            elif mailbox_entry.strip(): # Handle cases where split doesn't work as expected but entry is not empty
-                 result.append(mailbox_entry.strip('() /"').split(' "')[-1]) # More aggressive cleaning
+           
+            if not mailbox_entry or mailbox_entry.strip().upper() == 'NIL':
+                continue
+
+            # Updated strategy: Look for the last quoted string. If not found, take the last "word".
+            # This is a common pattern for mailbox names in LIST responses.
+            last_quoted_match = re.search(r'"([^\"\\]*(?:\\.[^\"\\]*)*)"$', mailbox_entry.strip())
+            name = None
+            if last_quoted_match:
+                name = last_quoted_match.group(1)
+            else:
+                # If no quoted string at the end, try to get the last word after the presumed delimiter part
+                # This assumes the delimiter and attributes take up the earlier part of the string.
+                parts = mailbox_entry.split() # Split by space
+                if parts:
+                    name = parts[-1] # Take the very last part
+                    # If this last part was actually part of flags like (\NoSelect), ignore it
+                    if name.startswith('(') and name.endswith(')'):
+                        name = None 
+                    elif name == "/": # if the last part is just the delimiter, also ignore
+                        name = None
+            
+            if name:
+                # Clean up: remove any leading/trailing spaces that might have been included
+                name = name.strip()
+                # Handle cases where name might be quoted by mistake by parts[-1] if it was like ""Name"" 
+                name = name.strip('"')
+
+                if name and name not in result: # Ensure it's not empty and not a duplicate
+                    result.append(name)
         return result
         
     async def close(self):

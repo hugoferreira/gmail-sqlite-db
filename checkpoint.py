@@ -19,6 +19,7 @@ class CheckpointManager:
         self.db_manager = db_manager
         self.mode = mode
         self.mailbox = mailbox if mailbox else 'INBOX' # Default mailbox if None
+        self._state_loaded_for_current_mailbox = False # ADDED: Flag to track if state is loaded
 
         # Internal state attributes, loaded/initialized from DB
         self.last_uid: int = 0
@@ -28,6 +29,9 @@ class CheckpointManager:
 
     async def _ensure_state_loaded(self):
         """Ensures state is loaded from DB. Call at the beginning of public async methods."""
+        if self._state_loaded_for_current_mailbox: # ADDED: Check the flag
+            return
+
         state_from_db = await self.db_manager.load_checkpoint_state(self.mode, self.mailbox)
         if state_from_db:
             self.last_uid = state_from_db['last_uid']
@@ -41,6 +45,7 @@ class CheckpointManager:
             self.failed_uids = {}
             self.in_progress = False
             self.timestamp = None
+        self._state_loaded_for_current_mailbox = True # ADDED: Set the flag
     
     async def save_state(self):
         """Save current core internal state (last_uid, in_progress, timestamp) to the database."""
@@ -57,6 +62,7 @@ class CheckpointManager:
     async def set_mailbox(self, mailbox: str):
         """Set current mailbox and load/initialize its state from the DB."""
         self.mailbox = mailbox if mailbox else 'INBOX'
+        self._state_loaded_for_current_mailbox = False # ADDED: Reset the flag
         await self._ensure_state_loaded() # Load state for the new mailbox
 
     async def mark_start(self):

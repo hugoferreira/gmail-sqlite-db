@@ -4,4 +4,24 @@ version = "0.1.0"
 description = "A Python tool for syncing and analyzing email data from Gmail using OAuth2 authentication, with support for full email content, attachments, and advanced querying capabilities."
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "aioimaplib>=2.0.1",
+    "aiosqlite>=0.19.0",
+    "google-auth>=2.27.0",
+    "google-auth-oauthlib>=1.2.0",
+    "tqdm>=4.66.2",
+    "tabulate>=0.9.0",
+    "termgraph>=0.5.3",
+    "fastapi",
+    "google-auth-httplib2",
+    "google-api-python-client",
+    "httpx",
+    "html2text",
+    "modelcontextprotocol",
+    "ollama",
+    "python-dotenv",
+    "uvicorn[standard]",
+    "pytest",
+    "pytest-asyncio",
+    "hypothesis"
+]

@@ -384,6 +384,136 @@ Here are some examples of SQL queries you can run directly against your SQLite d
 4.  **Querying (`queries` module):** Executes SQL queries against the database.
 5.  **Analytics (`analytics` module):** Runs aggregation queries and uses `termgraph` (if data is suitable) for visualization.
 
+## AI-Powered Email Intelligence Hub (MCP Server)
+
+This project can be transformed into an AI-First Local Email Intelligence Hub by running as a Model Context Protocol (MCP) server. This allows Large Language Models (LLMs), AI agents, and other MCP-compatible clients (like Cursor or Claude Desktop) to securely and intelligently interact with your email data, locally.
+
+**Why Use the MCP Server?**
+
+*   **Local & Private:** Your email data and any LLM interactions (if you integrate a local LLM like Ollama) remain on your machine, ensuring maximum privacy.
+*   **Intelligent Access:** Exposes your email data through a structured set of tools, enabling sophisticated queries, summarization, and analysis via LLMs.
+*   **Extensible:** Start with core email functions and pave the way for advanced AI capabilities like semantic search, automated classification, and draft generation.
+
+### Running the SyncEmail MCP Server
+
+1.  **Ensure Dependencies are Installed:**
+    Make sure your virtual environment is active and all requirements, including `modelcontextprotocol` and `uvicorn`, are installed:
+    ```bash
+    # If you haven't already, activate your virtual environment
+    # source .venv/bin/activate
+    uv pip install -r requirements.txt
+    ```
+
+2.  **Start the Server:**
+    Use the `serve-mcp` command. You'll need to provide your email address for context, even if just listing mailboxes from the local DB initially.
+    ```bash
+    uv run main.py --user your.email@gmail.com serve-mcp --mcp-host 0.0.0.0 --mcp-port 8001
+    ```
+    *   `--user YOUR_GMAIL_ADDRESS`: Your email address. Essential for the server to know which email account's data to surface, even if it's only from the local DB for some tools.
+    *   `--mcp-host HOST_IP`: The IP address the server will listen on. Use `0.0.0.0` to allow connections from any device on your local network, or `127.0.0.1` (localhost) for same-machine access only (default).
+    *   `--mcp-port PORT`: The port number the server will use (default: `8001`).
+
+    The server will start, and you should see output indicating it's running, for example:
+    ```
+    INFO:     Uvicorn running on http://0.0.0.0:8001 (Press CTRL+C to quit)
+    MCP Server starting up...
+    Database connected and ready.
+    ```
+
+### Connecting MCP Clients (e.g., Claude Desktop, Cursor)
+
+To use the SyncEmail MCP server with a client application, you typically need to tell the client how to find and run your local server. Many clients, like Claude Desktop, use a JSON configuration file.
+
+**Example Client Configuration (Claude Desktop `claude_desktop_config.json`):**
+
+Create or open your client's MCP configuration file. For Claude Desktop on macOS, this is usually at `~/Library/Application Support/Claude/claude_desktop_config.json` (Windows: `%APPDATA%\Claude\claude_desktop_config.json`).
+
+Add an entry for the SyncEmail server. **Remember to replace `/ABSOLUTE/PATH/TO/YOUR/gmail-sqlite-db` with the actual absolute path to your cloned project directory.**
+
+```json
+{
+  "mcpServers": {
+    "syncEmail": { // This is the name that will appear in your MCP client
+      "command": "uv",
+      "args": [
+        "run",
+        "--project-dir", "/ABSOLUTE/PATH/TO/YOUR/gmail-sqlite-db", // Crucial: Absolute path!
+        "main.py",
+        "--user", "your.email@gmail.com", // Match the email used to start the server
+        "serve-mcp",
+        "--mcp-port", "8001" // Ensure this port matches how you run the server
+      ],
+      "env": { // Optional: if you need to set environment variables for the server
+        // "YOUR_ENV_VAR": "value"
+      },
+      "startupTimeoutSeconds": 60 // Optional: time to wait for server to start
+    }
+    // You can add other MCP servers here
+  }
+}
+```
+
+**Key points for client configuration:**
+
+*   **`syncEmail`**: This is a label. You can name it whatever you like (e.g., "LocalEmailHub"). This name will appear in your MCP client's list of available tools/servers.
+*   **`command`**: The executable to run. We use `uv`.
+*   **`args`**: The arguments to pass to the command.
+    *   `--project-dir /ABSOLUTE/PATH/TO/YOUR/gmail-sqlite-db`: **This is critical.** Provide the full, absolute path to the root of your `gmail-sqlite-db` project directory. Relative paths usually don't work here.
+    *   `main.py`: The script to run.
+    *   `--user your.email@gmail.com`: **Important!** Provide the same email address you intend to use with the server. This ensures the server context is correct.
+    *   `serve-mcp`: The command for `main.py` to start the MCP server.
+    *   `--mcp-port 8001`: Match the port you use. If you change the port when running `uv run main.py ... serve-mcp`, change it here too.
+*   **Restart your MCP client** after saving the configuration file for changes to take effect.
+
+Once configured, your MCP client should list "syncEmail" (or your chosen name) as an available context/tool provider. You can then interact with its tools.
+
+### Available MCP Tools
+
+The SyncEmail MCP server exposes the following tools:
+
+*   **`health_check()`**
+    *   **Description:** Verifies that the MCP server is running and responsive.
+    *   **Parameters:** None.
+    *   **Returns:** A dictionary with server status and timestamp.
+    *   *Example LLM Interaction:* "Is the SyncEmail server online?"
+
+*   **`list_mailboxes()`**
+    *   **Description:** Lists all unique mailbox names found in the synchronized emails in your local database.
+    *   **Parameters:** None.
+    *   **Returns:** A list of mailbox name strings.
+    *   *Example LLM Interaction:* "What mailboxes have I synced with SyncEmail?"
+
+*   **`get_email_content_rendered(uid: str, mailbox: str, format: str = "markdown")`**
+    *   **Description:** Retrieves the content of a specific email, rendered in the desired format.
+    *   **Parameters:**
+        *   `uid` (str): The UID of the email.
+        *   `mailbox` (str): The mailbox where the email resides.
+        *   `format` (str, optional): Desired output format. Options: `"markdown"`, `"clean_text"`, `"raw"`. Defaults to `"markdown"`.
+    *   **Returns:** A dictionary containing the email content.
+    *   *Example LLM Interaction:* "Get the markdown content of email UID 12345 from INBOX."
+
+*   **`get_email_attachments(uid: str, mailbox: str)`**
+    *   **Description:** Retrieves a manifest (list of metadata) for attachments associated with a specific email.
+    *   **Parameters:**
+        *   `uid` (str): The UID of the email.
+        *   `mailbox` (str): The mailbox where the email resides.
+    *   **Returns:** A dictionary containing a list of attachment details (filename, MIME type, size, SHA256 hash, content_id).
+    *   *Example LLM Interaction:* "What attachments does email UID 67890 in 'Project Alpha' have?"
+
+*   **`trigger_sync(sync_mode: str, mailbox_name: str = "INBOX", all_mailboxes: bool = False, user_email: str = None)`**
+    *   **Description:** Initiates an email synchronization task. **Note:** This is currently a blocking operation on the server.
+    *   **Parameters:**
+        *   `sync_mode` (str): Type of sync. Options: `"headers"`, `"full"`, `"attachments"`.
+        *   `mailbox_name` (str, optional): The specific mailbox to sync. Defaults to `"INBOX"`.
+        *   `all_mailboxes` (bool, optional): If `true`, syncs all accessible mailboxes. Defaults to `false`.
+        *   `user_email` (str, optional): Your Gmail address. **Required** if `sync_mode` is `"headers"` or `"full"` to perform IMAP operations. Should match the `--user` the server was started with for consistency, but passed here for explicit sync operations.
+    *   **Returns:** A dictionary indicating the status of the sync operation.
+    *   *Example LLM Interaction:* "Trigger a 'headers' sync for the 'INBOX' using my.email@example.com with SyncEmail."
+
+**(Future AI Tools)**
+
+*As development progresses, tools for semantic search, email summarization, classification, and draft generation using local Ollama models will be added here.* This will further enhance SyncEmail as a private, AI-powered email assistant.
+
 ## License
 
 This project is licensed under the MIT License. See the `LICENSE` file for details.

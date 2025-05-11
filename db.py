@@ -452,6 +452,13 @@ class DatabaseManager:
             row = await cursor.fetchone()
             return row[0] if row and row[0] is not None else 0
 
+    async def get_raw_email_content(self, uid: str, mailbox: str) -> bytes | None:
+        """Retrieves the raw email content (blob) for a specific UID and mailbox."""
+        query = "SELECT raw_email FROM full_emails WHERE uid = ? AND mailbox = ?"
+        async with self.db.execute(query, (uid, mailbox)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
     # --- Checkpoint State DB Access Methods ---
     async def get_checkpoint_failed_uids(self, mode: str, mailbox: str) -> dict[str, int]:
         """Retrieves failed UIDs and their retry counts for a given mode and mailbox."""
