@@ -189,7 +189,11 @@ class EmailSyncer:
                     await self.db_manager.commit_with_retry()
                     
             await self.db_manager.commit_with_retry() 
-            await self.finish_sync('COMPLETED', f'Successfully processed {saved_count} {fetch_mode_desc}')
+            if saved_count > 0:
+                await self.finish_sync('COMPLETED', f'Successfully processed {saved_count} {fetch_mode_desc}')
+            else:
+                # If we processed UIDs but didn't save any, something might be wrong
+                await self.finish_sync('COMPLETED_NO_CHANGES', f'No new {fetch_mode_desc} saved despite processing {processed_count} UIDs')
             
         except KeyboardInterrupt:
             print("\nOperation interrupted by user. Saving progress...")
@@ -245,22 +249,28 @@ async def sync_email_headers(db_manager: DatabaseManager, imap_client: ImapClien
             print(f"Skipping {len(permanently_failed_uids)} UIDs for {mailbox} (failed >= {MAX_UID_FETCH_RETRIES} times). First few: {permanently_failed_uids[:5]}")
             
         all_uids_server = []
-        if mailbox == '[Gmail]/All Mail':
-            all_uids_server = await imap_client.search_by_date_chunks(start_year=2000)
-        elif mailbox in ['[Gmail]/Mail'] or 'All Mail' in mailbox: 
-            try:
-                all_uids_server = await imap_client.search_chunked()
-            except Exception as e:
-                print(f"Chunked search failed for {mailbox}: {e}. Falling back to date-based search.")
+        try:
+            if mailbox == '[Gmail]/All Mail':
                 all_uids_server = await imap_client.search_by_date_chunks(start_year=2000)
-        else:
-            all_uids_server = await imap_client.search_all()
+            elif mailbox in ['[Gmail]/Mail'] or 'All Mail' in mailbox: 
+                try:
+                    all_uids_server = await imap_client.search_chunked()
+                except Exception as e:
+                    print(f"Chunked search failed for {mailbox}: {e}. Falling back to date-based search.")
+                    all_uids_server = await imap_client.search_by_date_chunks(start_year=2000)
+            else:
+                all_uids_server = await imap_client.search_all()
+        except Exception as e:
+            # If any search operation fails completely, report the error
+            print(f"Search failed for {mailbox}: {e}")
+            await syncer.finish_sync('ERROR', str(e)[:200])
+            return
             
         final_uids_to_attempt_tuples = []
         if not all_uids_server:
             print(f"No emails found on server for mailbox {mailbox}.")
             if not uids_to_retry_list:
-                await syncer.finish_sync('COMPLETED', f'No emails found on server or to retry in {mailbox}')
+                await syncer.finish_sync('COMPLETED_NO_NEW_HEADERS', f'No emails found on server or to retry in {mailbox}')
                 return
             final_uids_to_attempt_tuples = [(uid, mailbox) for uid in sorted(list(set(uids_to_retry_list)), key=int)]
         else:
@@ -271,7 +281,7 @@ async def sync_email_headers(db_manager: DatabaseManager, imap_client: ImapClien
             
         if not final_uids_to_attempt_tuples:
             print(f'No new headers to fetch or retry for {mailbox}.')
-            await syncer.finish_sync('COMPLETED', f'No new headers to fetch or retry for {mailbox}')
+            await syncer.finish_sync('COMPLETED_NO_NEW_HEADERS', f'No new headers to fetch or retry for {mailbox}')
             return
             
         total_to_attempt_count = len(final_uids_to_attempt_tuples)
@@ -321,7 +331,7 @@ async def sync_full_emails(db_manager: DatabaseManager, imap_client: ImapClient,
         
         if not final_uids_to_attempt_tuples:
             print(f'No new full emails to fetch or retry for {mailbox}.')
-            await syncer.finish_sync('COMPLETED', f'No new full emails to fetch or retry for {mailbox}')
+            await syncer.finish_sync('COMPLETED_NO_NEW_EMAILS', f'No new full emails to fetch or retry for {mailbox}')
             return
             
         if config.DEBUG_MODE and total_to_attempt_count > 100:

@@ -1,24 +1,16 @@
 import argparse
 import asyncio
 import datetime
-import email
-import json
-import os
 import sys
 from typing import List, Dict, Any
-
-# Third-party imports
-import aiosqlite
 
 # Local imports
 import config # Ensure config is imported to allow modification of DEBUG_MODE
 from config import DEFAULT_DB_PATH, DEFAULT_CREDS_JSON_PATH
-from checkpoint import CheckpointManager
 from db import DatabaseManager
 from imap_client import ImapClient, get_credentials, display_mailboxes
-from utils import CHUNK_SIZE, EMAILS_PER_COMMIT
-from sync import EmailSyncer, sync_email_headers, sync_full_emails, sync_attachments
-from queries import QUERIES, METRIC_QUERIES, execute_query, list_available_queries
+from sync import sync_email_headers, sync_full_emails, sync_attachments
+from queries import METRIC_QUERIES, execute_query, list_available_queries
 from analytics import run_analytics
 
 # Placeholder for handler functions to be defined later
