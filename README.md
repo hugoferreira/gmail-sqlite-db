@@ -184,9 +184,45 @@ You can use `--metric` with any analytics visualization. The default is `emails`
 
 - [termgraph](https://github.com/mkaz/termgraph) must be installed (see requirements.txt).
 
-#### DRY Analytics
+#### Examples
 
-The analytics system is DRY: all metrics and visualizations use a unified, maintainable code path. You can easily add new metrics or visualizations.
+Here's an example:
+
+```
+$> uv run main.py --mode analytics --year 2011 --metric emails --calendar 
+
+Number of Emails calendar heatmap for 2011:
+
+     Dec Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec 
+Mon:  ▒░░▒ ▒▒▒ ░▒▒▒▒░░░░░▓▒▓▓▒░▒▒▒▒▒░░░▒░░▒▒▓▓▒▓▒ ▒▓▓▒▓▓▓▒
+Tue:  ▒░▒░░░░▓▒░▓▒▒▒░▒▓▒▒▒▒░▓▒▒▓▓▒▒▒░▒░▒░▒▒▒▒▓▒▓▒░▒▓▓▓▓█▓▒
+Wed:  ░░▒▒░▒░▒▒▒▒░░░░▒░░▒▓▓▒▒▒░▒▓▒░▒▒▒░░ ░▒▒░▒▓▒▒▒▒▓▓░▒▓█░
+Thu:  ░░░░░▒░▓▒░▒▒░░▒░░▒▒▒▒▒░▒░ ▓▒▒▓░░░░░▒░▒▒██▒░▒▒▒▒░▒▓▓░
+Fri:  ░▒▒░▒▒▒▒▒░░▒░▒▒░░░▒▒░▓░▓░▒▒░░▒▒░░░░░▒▒░▒▒▒▒▒▒▓▒█▓▓▒░
+Sat: ░░░░░░░░░░░░▒░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▒░ 
+Sun: ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ ░░░░░░░░░░░░░░░░░░░░░ 
+```
+
+And another:
+
+```
+$> uv run main.py --mode analytics --year 2023 --metric emails          
+
+Number of Emails for 2023 (monthly):
+
+Jan: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 427
+Feb: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 455
+Mar: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 571
+Apr: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 761
+May: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 679
+Jun: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 497
+Jul: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 510
+Aug: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 546
+Sep: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 1K
+Oct: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 1K
+Nov: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 1K
+Dec: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 1K
+```
 
 ### Query Mode
 
