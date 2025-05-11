@@ -7,7 +7,6 @@ import json
 import os
 import re
 import sys
-import textwrap
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from typing import List, Dict, Any
@@ -19,6 +18,8 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from tqdm import tqdm
 import tabulate
+import subprocess
+import shutil
 
 # OAuth2 setup
 SCOPES = ['https://mail.google.com/']
@@ -178,6 +179,106 @@ QUERIES = {
             LIMIT ?;
         ''',
         'params': {'limit': 20},
+    },
+}
+
+METRIC_QUERIES = {
+    'emails': {
+        'label': 'Number of Emails',
+        'monthly_sql': '''
+            SELECT strftime('%m', msg_date) as period, COUNT(*)
+            FROM emails
+            WHERE strftime('%Y', msg_date) = ?
+            GROUP BY period
+            ORDER BY period
+        ''',
+        'calendar_sql': '''
+            SELECT strftime('%Y-%m-%d', msg_date) as period, COUNT(*)
+            FROM emails
+            WHERE strftime('%Y', msg_date) = ?
+            GROUP BY period
+            ORDER BY period
+        '''
+    },
+    'attachments': {
+        'label': 'Number of Attachments',
+        'monthly_sql': '''
+            SELECT strftime('%m', e.msg_date) as period, COUNT(*)
+            FROM email_attachments ea
+            JOIN emails e ON ea.uid = e.uid AND ea.mailbox = e.mailbox
+            WHERE strftime('%Y', e.msg_date) = ?
+            GROUP BY period
+            ORDER BY period
+        ''',
+        'calendar_sql': '''
+            SELECT strftime('%Y-%m-%d', e.msg_date) as period, COUNT(*)
+            FROM email_attachments ea
+            JOIN emails e ON ea.uid = e.uid AND ea.mailbox = e.mailbox
+            WHERE strftime('%Y', e.msg_date) = ?
+            GROUP BY period
+            ORDER BY period
+        '''
+    },
+    'attachment_size': {
+        'label': 'Total Attachment Size (bytes)',
+        'monthly_sql': '''
+            SELECT strftime('%m', e.msg_date) as period, SUM(ab.size)
+            FROM email_attachments ea
+            JOIN emails e ON ea.uid = e.uid AND ea.mailbox = e.mailbox
+            JOIN attachment_blobs ab ON ea.sha256 = ab.sha256
+            WHERE strftime('%Y', e.msg_date) = ?
+            GROUP BY period
+            ORDER BY period
+        ''',
+        'calendar_sql': '''
+            SELECT strftime('%Y-%m-%d', e.msg_date) as period, SUM(ab.size)
+            FROM email_attachments ea
+            JOIN emails e ON ea.uid = e.uid AND ea.mailbox = e.mailbox
+            JOIN attachment_blobs ab ON ea.sha256 = ab.sha256
+            WHERE strftime('%Y', e.msg_date) = ?
+            GROUP BY period
+            ORDER BY period
+        '''
+    },
+    'unique_attachments': {
+        'label': 'Unique Attachments',
+        'monthly_sql': '''
+            SELECT strftime('%m', e.msg_date) as period, COUNT(DISTINCT ea.sha256)
+            FROM email_attachments ea
+            JOIN emails e ON ea.uid = e.uid AND ea.mailbox = e.mailbox
+            WHERE strftime('%Y', e.msg_date) = ?
+            GROUP BY period
+            ORDER BY period
+        ''',
+        'calendar_sql': '''
+            SELECT strftime('%Y-%m-%d', e.msg_date) as period, COUNT(DISTINCT ea.sha256)
+            FROM email_attachments ea
+            JOIN emails e ON ea.uid = e.uid AND ea.mailbox = e.mailbox
+            WHERE strftime('%Y', e.msg_date) = ?
+            GROUP BY period
+            ORDER BY period
+        '''
+    },
+    'avg_attachment_size': {
+        'label': 'Avg. Attachment Size (bytes)',
+        'monthly_sql': '''
+            SELECT strftime('%m', e.msg_date) as period, AVG(ab.size)
+            FROM email_attachments ea
+            JOIN emails e ON ea.uid = e.uid AND ea.mailbox = e.mailbox
+            JOIN attachment_blobs ab ON ea.sha256 = ab.sha256
+            WHERE strftime('%Y', e.msg_date) = ?
+            GROUP BY period
+            ORDER BY period
+        ''',
+        'calendar_sql': '''
+            SELECT strftime('%Y-%m-%d', e.msg_date) as period, AVG(ab.size)
+            FROM email_attachments ea
+            JOIN emails e ON ea.uid = e.uid AND ea.mailbox = e.mailbox
+            JOIN attachment_blobs ab ON ea.sha256 = ab.sha256
+            WHERE strftime('%Y', e.msg_date) = ?
+            GROUP BY period
+            ORDER BY period
+        '''
     },
 }
 
@@ -1235,17 +1336,160 @@ async def list_available_queries():
             for param_name, default_value in details['params'].items():
                 print(f"    --{param_name}={default_value}")
 
+async def sync_attachments(db_manager, mailbox='INBOX'):
+    """Extract attachments from full_emails and populate normalized attachment tables."""
+    import email as pyemail
+    from email import policy
+    import hashlib
+
+    # Create normalized tables
+    await db_manager.db.execute('''
+        CREATE TABLE IF NOT EXISTS attachment_blobs (
+            sha256 TEXT PRIMARY KEY,
+            content BLOB,
+            size INTEGER
+        )
+    ''')
+    await db_manager.db.execute('''
+        CREATE TABLE IF NOT EXISTS email_attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid TEXT,
+            mailbox TEXT,
+            sha256 TEXT,
+            filename TEXT,
+            fetched_at TEXT,
+            FOREIGN KEY(sha256) REFERENCES attachment_blobs(sha256)
+        )
+    ''')
+    await db_manager.db.execute('CREATE INDEX IF NOT EXISTS idx_email_attachments_uid_mailbox ON email_attachments(uid, mailbox)')
+    await db_manager.db.execute('CREATE INDEX IF NOT EXISTS idx_email_attachments_sha256 ON email_attachments(sha256)')
+    await db_manager.db.execute('CREATE INDEX IF NOT EXISTS idx_email_attachments_filename ON email_attachments(filename)')
+    await db_manager.db.commit()
+
+    # Create a view for easy querying
+    await db_manager.db.execute('''
+        CREATE VIEW IF NOT EXISTS attachment_info AS
+        SELECT ea.id, ea.uid, ea.mailbox, e.subject, ea.filename, ab.size, ab.sha256, ea.fetched_at
+        FROM email_attachments ea
+        LEFT JOIN emails e ON ea.uid = e.uid AND ea.mailbox = e.mailbox
+        LEFT JOIN attachment_blobs ab ON ea.sha256 = ab.sha256
+    ''')
+    await db_manager.db.commit()
+
+    # Get all full_emails for the mailbox
+    async with db_manager.db.execute('SELECT uid, mailbox, raw_email FROM full_emails WHERE mailbox = ?', (mailbox,)) as cursor:
+        rows = await cursor.fetchall()
+
+    print(f"Found {len(rows)} full emails in mailbox {mailbox} to scan for attachments.")
+    pbar = tqdm(total=len(rows), desc='Extracting attachments')
+    count = 0
+    for uid, mbox, raw_email in rows:
+        try:
+            msg = pyemail.message_from_bytes(raw_email, policy=policy.default)
+            for part in msg.walk():
+                content_disposition = part.get_content_disposition()
+                filename = part.get_filename()
+                if content_disposition == 'attachment' or (filename and content_disposition == 'inline'):
+                    payload = part.get_payload(decode=True)
+                    if filename and payload:
+                        size = len(payload)
+                        sha = hashlib.sha256(payload).hexdigest()
+                        # Insert into attachment_blobs if not exists
+                        await db_manager.db.execute(
+                            'INSERT OR IGNORE INTO attachment_blobs (sha256, content, size) VALUES (?, ?, ?)',
+                            (sha, payload, size)
+                        )
+                        # Always insert mapping
+                        await db_manager.db.execute(
+                            'INSERT INTO email_attachments (uid, mailbox, sha256, filename, fetched_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)',
+                            (uid, mbox, sha, filename)
+                        )
+                        count += 1
+        except Exception as e:
+            print(f"Error processing UID {uid}: {e}")
+        pbar.update(1)
+    pbar.close()
+    await db_manager.db.commit()
+    print(f"Extracted {count} attachments (including duplicates across emails).")
+
+    # Print deduplication stats
+    async with db_manager.db.execute('SELECT COUNT(DISTINCT sha256) FROM attachment_blobs') as cursor:
+        unique_attachments = (await cursor.fetchone())[0]
+    async with db_manager.db.execute('SELECT COUNT(*) FROM email_attachments') as cursor:
+        total_mappings = (await cursor.fetchone())[0]
+    duplicates = total_mappings - unique_attachments
+    print(f"Unique attachments: {unique_attachments}")
+    print(f"Total email-attachment mappings: {total_mappings}")
+    print(f"Duplicate mappings (attachments appearing in multiple emails): {duplicates}")
+
+async def analytics_email_density(db_manager, year=None, metric='emails'):
+    """Show a monthly density chart for a given year and metric using termgraph."""
+    if year is None:
+        year = datetime.datetime.now().year
+    metric_info = METRIC_QUERIES.get(metric, METRIC_QUERIES['emails'])
+    sql = metric_info['monthly_sql']
+    # Query monthly counts
+    async with db_manager.db.execute(sql, (str(year),)) as cursor:
+        data = await cursor.fetchall()
+    # Ensure all months are present
+    counts = [0]*12
+    for period, count in data:
+        counts[int(period)-1] = count if count is not None else 0
+    labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    # Prepare data for termgraph
+    import tempfile
+    with tempfile.NamedTemporaryFile('w+', delete=False) as f:
+        for label, count in zip(labels, counts):
+            f.write(f"{label} {count}\n")
+        temp_path = f.name
+    if not shutil.which('termgraph'):
+        print("termgraph is not installed. Please install it with 'pip install termgraph'.")
+        return
+    print(f"\n{metric_info['label']} for {year} (monthly):")
+    subprocess.run(['termgraph', temp_path, '--color', 'blue', '--width', '50', '--format', '{:.0f}'])
+    print()
+    os.unlink(temp_path)
+
+async def analytics_email_calendar_heatmap(db_manager, year=None, metric='emails'):
+    import tempfile, subprocess, shutil, os
+    if year is None:
+        year = datetime.datetime.now().year
+    metric_info = METRIC_QUERIES.get(metric, METRIC_QUERIES['emails'])
+    sql = metric_info['calendar_sql']
+    async with db_manager.db.execute(sql, (str(year),)) as cursor:
+        data = await cursor.fetchall()
+    with tempfile.NamedTemporaryFile('w+', delete=False) as f:
+        for period, count in data:
+            f.write(f"{period} {count}\n")
+        temp_path = f.name
+    if not shutil.which('termgraph'):
+        print("termgraph is not installed. Please install it with 'pip install termgraph'.")
+        return
+    print(f"\n{metric_info['label']} calendar heatmap for {year}:")
+    subprocess.run([
+        'termgraph', temp_path, '--calendar', '--start-dt', f'{year}-01-01', '--color', 'blue'
+    ])
+    print()
+    os.unlink(temp_path)
+
+async def run_analytics(db_manager, args):
+    metric = getattr(args, 'metric', 'emails')
+    if getattr(args, 'calendar', False):
+        await analytics_email_calendar_heatmap(db_manager, year=args.year, metric=metric)
+    else:
+        await analytics_email_density(db_manager, year=args.year, metric=metric)
+
 async def main():
     parser = argparse.ArgumentParser(description='Fetch Gmail emails to SQLite using OAuth2')
-    parser.add_argument('--db', default='emails.db', help='Path to SQLite database')
+    parser.add_argument('--db', default='mail.sqlite3', help='Path to SQLite database')
     parser.add_argument('--creds', help='Path to OAuth2 client secrets JSON')
     parser.add_argument('--host', default='imap.gmail.com', help='IMAP host')
     parser.add_argument('--user', help='Gmail address')
     parser.add_argument('--mailbox', default='INBOX', help='Mailbox name')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--list-mailboxes', action='store_true', help='List available mailboxes and exit')
-    parser.add_argument('--mode', choices=['headers', 'full', 'query'], default='headers', 
-                        help='Execution mode: headers (default), full (fetch full emails), or query (run queries)')
+    parser.add_argument('--mode', choices=['headers', 'full', 'query', 'attachments', 'analytics'], default='headers', 
+                        help='Execution mode: headers (default), full (fetch full emails), attachments (extract and normalize attachments), analytics (run analytics), or query (run queries)')
     
     # Query mode arguments
     parser.add_argument('--query', help='Name of query to execute (use --list-queries to see available queries)')
@@ -1256,6 +1500,9 @@ async def main():
     parser.add_argument('--start-date', help='Start date for date range queries (YYYY-MM-DD)')
     parser.add_argument('--end-date', help='End date for date range queries (YYYY-MM-DD)')
     parser.add_argument('--message-id', help='Message ID for thread queries')
+    parser.add_argument('--year', type=int, help='Year for analytics (default: current year)')
+    parser.add_argument('--calendar', action='store_true', help='Show calendar heatmap for analytics mode')
+    parser.add_argument('--metric', choices=['emails', 'attachments', 'attachment_size', 'unique_attachments', 'avg_attachment_size'], default='emails', help='Metric to visualize: emails, attachments, attachment_size, unique_attachments, avg_attachment_size')
     
     args = parser.parse_args()
     
@@ -1295,39 +1542,45 @@ async def main():
             await db_manager.close()
         return
     
-    # Credential check for non-query modes
-    if not args.creds:
-        sys.exit("Error: --creds parameter is required for sync modes")
-    if not args.user:
-        sys.exit("Error: --user parameter is required for sync modes")
-    
-    # Get OAuth2 credentials
-    creds = get_credentials(args.creds)
-    
+    # Only require creds and user for modes that need IMAP (headers, full, list-mailboxes)
+    needs_imap = args.mode in ['headers', 'full'] or args.list_mailboxes
+    creds = None
+    if needs_imap:
+        if not args.creds:
+            sys.exit("Error: --creds parameter is required for sync modes")
+        if not args.user:
+            sys.exit("Error: --user parameter is required for sync modes")
+        creds = get_credentials(args.creds)
+
     # Create database manager
     db_manager = DatabaseManager(args.db)
     db = await db_manager.connect()
-    
+
     try:
-        # Create IMAP client
-        imap_client = ImapClient(args.host, args.user, creds)
-        await imap_client.connect()
-        
+        imap_client = None
         # If the user wants to list mailboxes, do that and exit
         if args.list_mailboxes:
+            imap_client = ImapClient(args.host, args.user, creds)
+            await imap_client.connect()
             await display_mailboxes(imap_client)
             return
-        
         # Sync emails based on mode
         if args.mode == 'headers':
+            imap_client = ImapClient(args.host, args.user, creds)
+            await imap_client.connect()
             await sync_email_headers(db_manager, imap_client, args.mailbox)
         elif args.mode == 'full':
+            imap_client = ImapClient(args.host, args.user, creds)
+            await imap_client.connect()
             await sync_full_emails(db_manager, imap_client, args.mailbox)
-        
+        elif args.mode == 'attachments':
+            await sync_attachments(db_manager, args.mailbox)
+        elif args.mode == 'analytics':
+            await run_analytics(db_manager, args)
         print('Done.')
     finally:
         # Close connections
-        if 'imap_client' in locals():
+        if 'imap_client' in locals() and imap_client is not None:
             await imap_client.close()
         await db_manager.close()
 
