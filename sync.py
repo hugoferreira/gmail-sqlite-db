@@ -154,7 +154,7 @@ class EmailSyncer:
                 for uid_str, mbox in chunk:
                     try:
                         if prev_mailbox != mbox:
-                            if not await self.imap_client.select_mailbox(mbox):
+                            if not await self.imap_client.select_mailbox(mbox, read_only=True):
                                 await self.checkpoint.add_failed_uid(uid_str)
                                 self.failed_uids_counts[uid_str] = self.failed_uids_counts.get(uid_str, 0) + 1
                                 self.pbar.update(1) 
@@ -230,7 +230,7 @@ async def sync_email_headers(db_manager: DatabaseManager, imap_client: ImapClien
     await syncer.start_sync(f'Starting headers sync for {mailbox}')
     
     try:
-        if not await imap_client.select_mailbox(mailbox):
+        if not await imap_client.select_mailbox(mailbox, read_only=True):
             await syncer.finish_sync('ERROR', f'Failed to select mailbox {mailbox}')
             return
             
@@ -299,6 +299,10 @@ async def sync_full_emails(db_manager: DatabaseManager, imap_client: ImapClient,
     await syncer.start_sync(f'Starting full email sync for {mailbox}') 
     
     try:
+        if not await imap_client.select_mailbox(mailbox, read_only=True):
+            await syncer.finish_sync('ERROR', f'Failed to select mailbox {mailbox}')
+            return
+
         all_header_uids_db = await db_manager.get_all_header_uids_for_mailbox(mailbox)
         if not all_header_uids_db:
             print(f"No email headers found in DB for mailbox {mailbox}. Sync headers first.")

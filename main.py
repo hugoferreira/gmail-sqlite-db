@@ -37,17 +37,17 @@ async def handle_query_command(args):
     await db_manager.connect()
     try:
         if args.list_queries:
-            await list_available_queries()
+            await list_available_queries(db_manager)
         elif args.query_name:
             query_params = {}
             if args.limit is not None: query_params['limit'] = args.limit
             if args.start_date: query_params['start_date'] = args.start_date
             if args.end_date: query_params['end_date'] = args.end_date
             if args.message_id: query_params['message_id'] = args.message_id
-            await execute_query(db_manager.db, args.query_name, **query_params)
+            await execute_query(db_manager, args.query_name, **query_params)
         else:
             print("Error: No query name specified. Use --list-queries to see available queries.")
-            await list_available_queries()
+            await list_available_queries(db_manager)
     finally:
         if db_manager and db_manager.db:
             await db_manager.close()
@@ -57,7 +57,7 @@ async def handle_analytics_command(args):
     db_manager = DatabaseManager(args.db)
     await db_manager.connect()
     try:
-        await run_analytics(db_manager, args)
+        await run_analytics(db_manager, year=args.year, calendar=args.calendar, metric=args.metric)
     finally:
         if db_manager and db_manager.db:
             await db_manager.close()
@@ -84,24 +84,24 @@ async def handle_sync_command(args):
             if all_mailboxes_flag:
                 mailboxes_to_sync = await imap_client.list_mailboxes()
                 for mbx in mailboxes_to_sync:
-                    await sync_email_headers(db_manager, imap_client, mbx)
+                    await sync_email_headers(db_manager=db_manager, imap_client=imap_client, mailbox=mbx)
             else:
-                await sync_email_headers(db_manager, imap_client, sync_target_mailbox)
+                await sync_email_headers(db_manager=db_manager, imap_client=imap_client, mailbox=sync_target_mailbox)
         elif args.sync_mode == 'full':
             if all_mailboxes_flag:
                 mailboxes_to_sync = await imap_client.list_mailboxes()
                 for mbx in mailboxes_to_sync:
-                    await sync_full_emails(db_manager, imap_client, mbx)
+                    await sync_full_emails(db_manager=db_manager, imap_client=imap_client, mailbox=mbx)
             else:
-                await sync_full_emails(db_manager, imap_client, sync_target_mailbox)
+                await sync_full_emails(db_manager=db_manager, imap_client=imap_client, mailbox=sync_target_mailbox)
         elif args.sync_mode == 'attachments':
             # Attachments mode might not need a live imap client if working from DB
             if all_mailboxes_flag:
                 mailboxes_to_sync = await db_manager.get_mailboxes_from_full_emails()
                 for mbx in mailboxes_to_sync:
-                    await sync_attachments(db_manager, mbx)
+                    await sync_attachments(db_manager=db_manager, mailbox=mbx)
             else:
-                await sync_attachments(db_manager, sync_target_mailbox)
+                await sync_attachments(db_manager=db_manager, mailbox=sync_target_mailbox)
         print(f"Sync mode '{args.sync_mode}' completed.")
     finally:
         if imap_client:
