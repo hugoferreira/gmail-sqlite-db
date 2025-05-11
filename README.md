@@ -1,589 +1,389 @@
-# SyncEmail (a.k.a. GMail to SQLite)
+# SyncEmail: Your Gmail to SQLite Powerhouse
 
-A Python tool to efficiently sync Gmail emails to a local SQLite database using OAuth 2.0 authentication. But before you go...
-A Python tool to efficiently sync Gmail email headers and content to a local SQLite database using OAuth 2.0 authentication. But before you go...
+SyncEmail is a Python-based command-line tool designed to efficiently download, store, and analyze your Gmail emails by synchronizing them to a local SQLite database. It features robust OAuth 2.0 authentication, flexible sync modes, powerful querying capabilities, and insightful analytics, all accessible through a clear and modular interface.
 
-## Responsible AI usage
+> _A Note on Origins: This project benefited from AI-assisted development. While refined and functional, it began as a collaborative effort with an LLM. We've aimed for robust, human-quality code and documentation._
 
-This project is yet another product of AI-assisted development (or as the hipsters call it, "Vibe Coding"). I needed a quick solution and let an LLM do the heavy lifting. While it (seemingly) works, the code quality might make your eyes water (and I've seen some pretty gnarly code in my time). Consider this your official warning: proceed with caution and maybe keep a bot^H^H^H some eye drops handy.
+*A Note from the Author*: The above paragraph was written by the LLM. ROTFL!!!
 
-## Features
+## Key Features
 
-- **OAuth 2.0 Authentication**: Secure access to Gmail without storing your password
-- **Header-Only Sync**: Efficiently stores only email metadata, not full content
-- **Full Email Mode**: Option to download and store complete emails including attachments
-- **Incremental Updates**: Resumes where it left off for efficient syncing
-- **Checkpoint System**: Saves progress regularly to prevent data loss
-- **Error Handling**: Tracks failed emails for retry in subsequent runs
-- **SQLite Storage**: Fast, portable database that requires no separate server
-- **Query Mode**: Built-in analytical queries for exploring your email data
-- **Smart Schema Migration**: Automatically updates database schema when needed
-- **Attachments Extraction**: Extract, normalize, and deduplicate email attachments
-- **Attachment Deduplication**: Store each unique attachment only once using SHA-256 hashing
-- **Date-Based Chunking**: Smart handling of very large mailboxes like "[Gmail]/All Mail"
-- **Mailbox-Specific Tracking**: Maintain separate sync state for each mailbox
-- **Multi-Mailbox Sync**: Sync all available mailboxes in one command
-- **Analytics Visualizations**: Text-based charts and calendar heatmaps for email data
+*   **Secure Gmail Access:** Utilizes OAuth 2.0 for authentication, never storing your password.
+*   **Flexible Synchronization:**
+    *   **Headers-Only Sync:** Quickly download email metadata (sender, recipient, subject, date).
+    *   **Full Email Sync:** Download complete email content, including body and attachments.
+    *   **Attachment Extraction:** Process downloaded full emails to extract, normalize, and deduplicate attachments.
+*   **Efficient & Resilient:**
+    *   **Incremental Updates:** Only fetches new or changed data since the last sync.
+    *   **Checkpoint System:** Saves progress regularly per mailbox and sync mode, allowing resumption after interruptions.
+    *   **Error Tracking:** Identifies and logs emails that failed to process, with options for retrying.
+*   **Local SQLite Database:**
+    *   **Portable & Fast:** Stores all data in a single file, requiring no external database server.
+    *   **Rich Schema:** Includes generated columns for quick insights (e.g., `has_attachments`, `message_size_kb`, `message_id`).
+    *   **Automatic Schema Migrations:** The tool can often detect and apply necessary schema updates.
+*   **Powerful Data Interaction:**
+    *   **Query Mode:** Execute predefined and custom SQL queries to explore your email data.
+    *   **Analytics Mode:** Generate text-based charts and calendar heatmaps for email and attachment statistics directly in your terminal.
+*   **Advanced Functionality:**
+    *   **Attachment Deduplication:** Saves storage by storing each unique attachment (by SHA256 hash) only once.
+    *   **Large Mailbox Handling:** Employs chunking strategies for robust syncing of very large mailboxes (e.g., "[Gmail]/All Mail").
+    *   **Multi-Mailbox Operations:** Sync all or selected mailboxes with a single command.
 
-## Requirements
+## Prerequisites
 
-- Python 3.7 or higher
-- [uv](https://github.com/astral-sh/uv) - Fast Python package installer and resolver (recommended)
-- Required packages (installed via `uv pip install -r requirements.txt`):
-  - aiosqlite: Asynchronous SQLite database access
-  - google-auth, google-auth-oauthlib: OAuth2 authentication with Google
-  - tqdm: Progress bars for sync operations
-  - tabulate: Formatted table output for query results
-  - termgraph: Text-based visualizations for analytics mode
+*   Python 3.7 or higher.
+*   [uv](https://github.com/astral-sh/uv): A fast Python package installer and resolver (recommended for environment and package management).
 
 ## Installation
 
-1. Clone this repository:
-   ```
-   git clone https://github.com/hugoferreira/gmail-sqlite-db.git
-   cd gmail-sqlite-db
-   ```
+1.  **Clone the Repository:**
+    ```bash
+    git clone https://github.com/hugoferreira/gmail-sqlite-db.git
+    cd gmail-sqlite-db
+    ```
 
-2. Install `uv` if you don't have it yet:
-   ```
-   pip install uv
-   ```
+2.  **Install `uv` (if not already installed):**
+    ```bash
+    pip install uv
+    ```
+    (Or follow official `uv` installation instructions for your system.)
 
-3. Create a virtual environment and install dependencies:
-   ```
-   uv venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-   uv pip install -r requirements.txt
-   ```
+3.  **Create a Virtual Environment and Install Dependencies:**
+    ```bash
+    uv venv
+    source .venv/bin/activate  # On Windows: .venv\\Scripts\\activate
+    uv pip install -r requirements.txt
+    ```
 
-4. Create OAuth 2.0 credentials:
-   - Go to the [Google Cloud Console](https://console.cloud.google.com/)
-   - Create a new project
-   - Enable the Gmail API
-   - Create OAuth 2.0 Client ID credentials (Desktop application)
-   - Download the credentials JSON file and save it as `creds.json` in the project directory
+## Google OAuth 2.0 Setup
+
+To allow SyncEmail to access your Gmail account, you need to create OAuth 2.0 credentials:
+
+1.  Go to the [Google Cloud Console](https://console.cloud.google.com/).
+2.  **Create a new project** or select an existing one.
+3.  **Enable the Gmail API:**
+    *   Navigate to "APIs & Services" > "Library".
+    *   Search for "Gmail API" and enable it for your project.
+4.  **Configure OAuth consent screen:**
+    *   Navigate to "APIs & Services" > "OAuth consent screen".
+    *   Choose "External" (unless you have a Google Workspace account and want to limit it internally).
+    *   Fill in the required application details (app name, user support email, developer contact).
+    *   Scopes: You don't need to add scopes here; the application will request them.
+    *   Test users: Add your Gmail address(es) as test users while the app is in "testing" status.
+5.  **Create OAuth 2.0 Client ID credentials:**
+    *   Navigate to "APIs & Services" > "Credentials".
+    *   Click "Create Credentials" > "OAuth client ID".
+    *   Select "Desktop app" as the Application type.
+    *   Give it a name (e.g., "SyncEmail Client").
+6.  **Download Credentials:**
+    *   After creation, download the JSON file.
+    *   Save this file as `creds.json` in the SyncEmail project directory, or use a custom path via the `--creds` argument.
+
+The first time you run a command requiring Gmail access (like `sync` or `list-mailboxes`), SyncEmail will open a browser window, asking you to log in to your Google account and grant permission. After successful authorization, a `token.json` file will be created in your project directory to store your access and refresh tokens for future sessions.
 
 ## Usage
 
-Run the tool with the following command:
+SyncEmail is controlled via command-line arguments and sub-commands.
 
+**Basic Command Structure:**
+```bash
+uv run main.py [GLOBAL_OPTIONS] COMMAND [COMMAND_OPTIONS]
 ```
-uv run --active main.py --db ./mail.sqlite3 --creds creds.json --user your.email@gmail.com
-```
+Activate your virtual environment (`source .venv/bin/activate`) before running.
 
-> **Note:** The `--creds` and `--user` arguments are only required for sync modes (`headers`, `full`, and `--list-mailboxes`). For analytics, attachments, and query modes, you do **not** need to provide these arguments.
+### Global Options
 
-### Command Line Arguments
+These options can be used with any command:
 
-- `--db`: Path to SQLite database (default: `emails.db`)
-- `--creds`: Path to OAuth2 client secrets JSON (**required only for sync modes**)
-- `--host`: IMAP host (default: `imap.gmail.com`)
-- `--user`: Gmail address (**required only for sync modes**)
-- `--mailbox`: Mailbox name (default: `INBOX`)
-- `--all-mailboxes`: Sync all available mailboxes (for `headers`, `full`, and `attachments` modes)
-- `--debug`: Enable debug mode
-- `--list-mailboxes`: List available mailboxes and exit
-- `--mode`: Execution mode: `headers` (default), `full` (fetch full emails), `attachments` (extract and normalize attachments), `analytics` (run analytics), or `query` (run queries)
-- `--year`: Year for analytics (default: current year)
-- `--calendar`: Show calendar heatmap for analytics mode
-- `--metric`: Metric to visualize in analytics mode (see below)
+*   `--db DB_PATH`: Path to the SQLite database file.
+    *   Default: `mail.sqlite3` (as defined in `config.py`)
+*   `--creds CREDS_PATH`: Path to your OAuth2 client secrets JSON file.
+    *   Default: `creds.json` (as defined in `config.py`)
+*   `--host IMAP_HOST`: IMAP host address.
+    *   Default: `imap.gmail.com`
+*   `--user YOUR_GMAIL_ADDRESS`: Your Gmail address. **Required for commands that access Gmail.**
+*   `--debug`: Enable detailed debug output.
 
-### Syncing Email Headers
+### Commands
 
-To sync only email headers (default mode):
+#### 1. `list-mailboxes`
 
-```
-uv run --active main.py --creds creds.json --user your.email@gmail.com
-```
+Lists all available mailboxes on your Gmail account.
 
-To sync headers from all mailboxes:
+**Required Global Options:** `--user`, `--creds` (if not default), `--host` (if not default).
 
-```
-uv run --active main.py --creds creds.json --user your.email@gmail.com --all-mailboxes
+**Example:**
+```bash
+uv run main.py --user your.email@gmail.com list-mailboxes
 ```
 
-### Syncing Full Emails
+#### 2. `sync`
 
-To download complete emails including attachments:
+Synchronizes emails with the local database. This command has several sub-modes:
 
-```
-uv run --active main.py --mode full --creds creds.json --user your.email@gmail.com
-```
+**Common Sync Options (for `headers`, `full`, `attachments` modes):**
 
-Note: Always sync headers first before syncing full emails.
+*   `--mailbox MAILBOX_NAME`: Specific mailbox to target (e.g., "INBOX", "Sent").
+    *   Default: `INBOX`
+*   `--all-mailboxes`: Apply the sync operation to all accessible mailboxes.
 
-### Extracting and Normalizing Attachments
+**Required Global Options for `sync headers` and `sync full`:** `--user`, `--creds`, `--host`.
+**Required Global Options for `sync attachments`:** Only `--db` (IMAP access is not needed as it works from the local DB).
 
-After syncing full emails, you can extract and normalize attachments:
+**Sub-modes for `sync`:**
 
-```
-uv run --active main.py --mode attachments --db ./mail.sqlite3
-```
+*   **`headers`**: Syncs only email headers (metadata).
+    ```bash
+    # Sync headers for INBOX
+    uv run main.py --user your.email@gmail.com sync headers
+    # Sync headers for a specific mailbox
+    uv run main.py --user your.email@gmail.com sync headers --mailbox "Sent Items"
+    # Sync headers for all mailboxes
+    uv run main.py --user your.email@gmail.com sync headers --all-mailboxes
+    ```
 
-This will:
-- Extract all attachments from the full emails
-- Store unique attachments only once (deduplication via SHA-256 hashing)
-- Create normalized tables relating emails to attachments
-- Show statistics about attachment deduplication
+*   **`full`**: Syncs full email content (body and attachments). Headers should ideally be synced first.
+    ```bash
+    # Sync full emails for INBOX
+    uv run main.py --user your.email@gmail.com sync full
+    # Sync full emails for all mailboxes
+    uv run main.py --user your.email@gmail.com sync full --all-mailboxes
+    ```
 
-For all mailboxes:
+*   **`attachments`**: Extracts and normalizes attachments from already downloaded full emails.
+    ```bash
+    # Extract attachments for INBOX (from emails in mail.sqlite3)
+    uv run main.py sync attachments --mailbox INBOX
+    # Extract attachments for all mailboxes
+    uv run main.py sync attachments --all-mailboxes
+    ```
 
-```
-uv run --active main.py --mode attachments --db ./mail.sqlite3 --all-mailboxes
-```
+#### 3. `query`
 
-### Listing Available Mailboxes
+Executes predefined SQL queries against the email database.
 
-To see all available mailboxes in your email account, use the `--list-mailboxes` argument:
+**Required Global Options:** `--db` (if not default).
 
-```
-uv run --active main.py --creds creds.json --user your.email@gmail.com --list-mailboxes
-```
+**Query Options:**
 
-This will display a list of all mailboxes you can access, which you can then use with the `--mailbox` argument to sync emails from a specific mailbox.
+*   `--list-queries`: List all available predefined queries.
+*   `query_name`: (Positional argument) The name of the query to execute.
+*   `--limit N`: Limit the number of results.
+*   `--start-date YYYY-MM-DD`: Start date for date-sensitive queries.
+*   `--end-date YYYY-MM-DD`: End date for date-sensitive queries.
+*   `--message-id MSG_ID`: Message-ID for email thread queries.
 
-### Analytics Mode
+**Examples:**
+```bash
+# List available queries
+uv run main.py query --list-queries
 
-The analytics mode allows you to visualize your email and attachment data using text-based charts and heatmaps in the terminal. It uses [termgraph](https://github.com/mkaz/termgraph) for visualization (make sure it is installed).
+# Get top 10 senders
+uv run main.py query top_senders --limit 10
 
-#### Example Usage
+# View emails from a specific date range
+uv run main.py query date_range --start-date 2023-01-01 --end-date 2023-01-31
 
-**Monthly email density bar chart:**
-```
-python main.py --mode analytics --db mail.sqlite3 --year 2023
-```
-
-**Calendar heatmap of email activity:**
-```
-python main.py --mode analytics --db mail.sqlite3 --year 2023 --calendar
-```
-
-**Monthly number of attachments:**
-```
-python main.py --mode analytics --db mail.sqlite3 --year 2023 --metric attachments
-```
-
-**Calendar heatmap of total attachment size:**
-```
-python main.py --mode analytics --db mail.sqlite3 --year 2023 --calendar --metric attachment_size
-```
-
-#### Available Metrics
-
-| Metric                | Description                                      |
-|-----------------------|--------------------------------------------------|
-| emails                | Number of emails                                 |
-| attachments           | Number of attachments (by email date)            |
-| attachment_size       | Total attachment size in bytes (by email date)   |
-| unique_attachments    | Unique attachments (by hash, by email date)      |
-| avg_attachment_size   | Average attachment size in bytes (by email date) |
-
-You can use `--metric` with any analytics visualization. The default is `emails`.
-
-#### Requirements
-
-- [termgraph](https://github.com/mkaz/termgraph) must be installed (see requirements.txt).
-
-#### Examples
-
-Here's an example:
-
-```
-$> uv run main.py --mode analytics --year 2011 --metric emails --calendar 
-
-Number of Emails calendar heatmap for 2011:
-
-     Dec Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec 
-Mon:  ▒░░▒ ▒▒▒ ░▒▒▒▒░░░░░▓▒▓▓▒░▒▒▒▒▒░░░▒░░▒▒▓▓▒▓▒ ▒▓▓▒▓▓▓▒
-Tue:  ▒░▒░░░░▓▒░▓▒▒▒░▒▓▒▒▒▒░▓▒▒▓▓▒▒▒░▒░▒░▒▒▒▒▓▒▓▒░▒▓▓▓▓█▓▒
-Wed:  ░░▒▒░▒░▒▒▒▒░░░░▒░░▒▓▓▒▒▒░▒▓▒░▒▒▒░░ ░▒▒░▒▓▒▒▒▒▓▓░▒▓█░
-Thu:  ░░░░░▒░▓▒░▒▒░░▒░░▒▒▒▒▒░▒░ ▓▒▒▓░░░░░▒░▒▒██▒░▒▒▒▒░▒▓▓░
-Fri:  ░▒▒░▒▒▒▒▒░░▒░▒▒░░░▒▒░▓░▓░▒▒░░▒▒░░░░░▒▒░▒▒▒▒▒▒▓▒█▓▓▒░
-Sat: ░░░░░░░░░░░░▒░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▒░ 
-Sun: ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ ░░░░░░░░░░░░░░░░░░░░░ 
+# Find emails in a conversation thread
+uv run main.py query thread --message-id "<message-id@example.com>"
 ```
 
-And another:
+#### 4. `analytics`
 
+Generates and displays analytics from the email database using text-based charts.
+
+**Required Global Options:** `--db` (if not default).
+
+**Analytics Options:**
+
+*   `--year YYYY`: Year for which to generate analytics (default: current year).
+*   `--calendar`: Display a calendar heatmap instead of a monthly density chart.
+*   `--metric METRIC_NAME`: Metric to visualize. Default: `emails`.
+    Available metrics (defined in `queries.py` under `METRIC_QUERIES`):
+    *   `emails`: Number of emails.
+    *   `attachments`: Number of attachments (by email date).
+    *   `attachment_size`: Total attachment size in bytes (by email date).
+    *   `unique_attachments`: Unique attachments by hash (by email date).
+    *   `avg_attachment_size`: Average attachment size in bytes (by email date).
+
+**Examples:**
+```bash
+# Monthly email density bar chart for 2023
+uv run main.py analytics --year 2023
+
+# Calendar heatmap of email activity for 2023
+uv run main.py analytics --year 2023 --calendar
+
+# Monthly number of attachments for 2023
+uv run main.py analytics --year 2023 --metric attachments
+
+# Calendar heatmap of total attachment size for 2023
+uv run main.py analytics --year 2023 --calendar --metric attachment_size
 ```
-$> uv run main.py --mode analytics --year 2023 --metric emails          
+Example output:
+```
+$> uv run main.py analytics --year 2023 --metric emails          
 
 Number of Emails for 2023 (monthly):
 
 Jan: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 427
 Feb: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 455
-Mar: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 571
-Apr: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 761
-May: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 679
-Jun: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 497
-Jul: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 510
-Aug: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 546
-Sep: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 1K
-Oct: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 1K
-Nov: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 1K
-Dec: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 1K
+...
 ```
-
-### Query Mode
-
-The query mode allows you to run predefined analytical queries on your email database:
-
-#### List Available Queries
-
-```
-uv run --active main.py --mode query --list-queries
-```
-
-#### Running Queries
-
-To run a specific query:
-
-```
-uv run --active main.py --mode query --db ./mail.sqlite3 --query top_senders
-```
-
-#### Query Parameters
-
-The following parameters can be used to customize queries:
-
-- `--limit`: Maximum number of results to return
-- `--start-date`: Start date for date range queries (YYYY-MM-DD format)
-- `--end-date`: End date for date range queries (YYYY-MM-DD format)
-- `--message-id`: Message ID for thread queries
-
-#### Query Examples
-
-1. Get top email senders:
-   ```
-   uv run --active main.py --mode query --query top_senders --limit 20
-   ```
-
-2. View emails from a specific date range:
-   ```
-   uv run --active main.py --mode query --query date_range --start-date 2023-01-01 --end-date 2023-12-31
-   ```
-
-3. Find large emails with attachments:
-   ```
-   uv run --active main.py --mode query --query large_attachments
-   ```
-
-4. See recent emails:
-   ```
-   uv run --active main.py --mode query --query recent --limit 10
-   ```
-
-5. Get a summary of your email database:
-   ```
-   uv run --active main.py --mode query --query summary
-   ```
-
-6. See distribution of emails by domain:
-   ```
-   uv run --active main.py --mode query --query email_domains
-   ```
-
-7. View emails with images:
-   ```
-   uv run --active main.py --mode query --query emails_with_images
-   ```
-
-8. See emails in a conversation thread (requires message ID):
-   ```
-   uv run --active main.py --mode query --query thread --message-id "<message-id@example.com>"
-   ```
 
 ## Database Schema
 
-The SQLite database contains the following main tables:
+The SQLite database (`mail.sqlite3` by default) stores your email data in several tables:
 
-1. `emails` - Stores email metadata:
-   - `uid` - Email UID (primary key)
-   - `msg_from` - Sender information
-   - `msg_to` - Recipient information
-   - `msg_cc` - CC recipients
-   - `subject` - Email subject
-   - `msg_date` - Date in ISO format
-   - `mailbox` - Source mailbox name (e.g., "INBOX", "Sent", etc.)
+1.  **`emails`**: Core metadata for each email.
+    *   `uid`: Email UID (unique per mailbox).
+    *   `msg_from`, `msg_to`, `msg_cc`: Sender, recipient(s), CC recipient(s).
+    *   `subject`: Email subject.
+    *   `msg_date`: Date in ISO format.
+    *   `mailbox`: Source mailbox name.
 
-2. `full_emails` - Stores complete email content with generated columns:
-   - `uid` - Email UID (primary key, matches `emails` table)
-   - `mailbox` - Mailbox name
-   - `raw_email` - Complete raw email content (BLOB)
-   - `fetched_at` - Timestamp when the email was fetched
-   - Generated columns (calculated automatically):
-     - `has_attachments` - Boolean indicating if the email has attachments
-     - `message_size_kb` - Size of the email in KB
-     - `is_html` - Boolean indicating if the email has HTML content
-     - `is_plain_text` - Boolean indicating if the email has plain text content
-     - `has_images` - Boolean indicating if the email has embedded images
-     - `in_reply_to` - Message ID this email is replying to
-     - `message_id` - Unique message ID
+2.  **`full_emails`**: Stores complete raw email content and derived metadata.
+    *   `uid`, `mailbox`: Foreign keys to the `emails` table.
+    *   `raw_email`: Complete raw email content (BLOB).
+    *   `fetched_at`: Timestamp of when the full email was downloaded.
+    *   Generated columns (automatically populated by SQLite if supported, or by the application during insertion if not):
+        *   `has_attachments`: (Boolean) Whether the email contains attachments.
+        *   `message_size_kb`: (Integer) Size of the email in kilobytes.
+        *   `is_html`, `is_plain_text`: (Boolean) Indicates content types.
+        *   `has_images`: (Boolean) Whether the email has embedded images.
+        *   `in_reply_to`, `message_id`: Standard email header fields for threading.
 
-3. `sync_status` - Tracks sync operations:
-   - `id` - Sync operation ID
-   - `last_uid` - Last processed UID
-   - `start_time` - When sync started
-   - `end_time` - When sync completed
-   - `status` - Current status (STARTED, COMPLETED, ERROR, INTERRUPTED)
-   - `message` - Additional status information
+3.  **`attachment_blobs`**: Stores unique attachment binary data.
+    *   `sha256`: SHA-256 hash of the attachment content (Primary Key). Ensures deduplication.
+    *   `content`: Binary content of the attachment (BLOB).
+    *   `size`: Size of the attachment in bytes.
+    *   `fetched_at`: Timestamp of when the blob was first stored.
 
-4. `attachment_blobs` - Stores unique attachment content:
-   - `sha256` - SHA-256 hash of the content (primary key)
-   - `content` - Binary content of the attachment (BLOB)
-   - `size` - Size of the attachment in bytes
-   - `fetched_at` - Timestamp when attachment was extracted
+4.  **`email_attachments`**: Links emails to their attachments.
+    *   `id`: Auto-incrementing primary key.
+    *   `uid`, `mailbox`: Identifies the email.
+    *   `sha256`: Foreign key to `attachment_blobs.sha256`.
+    *   `filename`: Original filename of the attachment.
+    *   `fetched_at`: Timestamp of when this mapping was created.
 
-5. `email_attachments` - Maps emails to attachments:
-   - `id` - Primary key
-   - `uid` - Email UID (references emails table)
-   - `mailbox` - Mailbox name
-   - `sha256` - SHA-256 hash (references attachment_blobs table)
-   - `filename` - Original filename of the attachment
-   - `fetched_at` - Timestamp when mapping was created
+5.  **`attachment_info` (View)**: A pre-defined SQL view for convenient querying of attachment details along with email metadata. It joins `email_attachments`, `attachment_blobs`, and `emails`.
 
-6. `attachment_info` - A view joining email_attachments with emails and attachment_blobs:
-   - Provides a unified view of attachments with email metadata
-   - Includes sender, recipient, subject, date, filename, size, etc.
+6.  **`sync_status`**: Logs metadata about synchronization operations.
+    *   `id`: Sync operation ID.
+    *   `last_uid`: Last processed UID during the sync operation (context-dependent).
+    *   `start_time`, `end_time`: Timestamps for the operation.
+    *   `status`: e.g., `STARTED`, `COMPLETED`, `ERROR`, `INTERRUPTED`.
+    *   `message`: Additional information about the sync status.
 
-## Checkpoint System
+## Key Concepts and Advanced Details
 
-The tool uses a sophisticated checkpoint system to track progress:
+*   **Checkpoint System:**
+    SyncEmail uses JSON files (in a `.checkpoints` directory) to save the progress of sync operations. This is done separately for each mailbox and for each sync mode (`headers`, `full`, `attachments`). If a sync is interrupted, it can resume from the last successfully processed point, significantly improving efficiency for large mailboxes or unstable connections. Failed UIDs are also tracked for potential retries.
 
-- **Mailbox-specific tracking**: Each mailbox has its own independent sync state
-- **Resumable operations**: The tool can resume from where it left off for each mailbox
-- **Failed email tracking**: UIDs that failed to sync are retried in subsequent runs
-- **Progress persistence**: Checkpoint files save the state between runs
+*   **Handling Large Mailboxes:**
+    For exceptionally large mailboxes (like Gmail's "[Gmail]/All Mail"), fetching all UIDs at once can be problematic. SyncEmail employs strategies like date-based chunking (searching for emails in monthly segments) or sequence-based chunking to manage these scenarios more reliably.
 
-## Handling Large Mailboxes
-
-The tool has special handling for very large mailboxes like "[Gmail]/All Mail":
-
-- **Date-based chunking**: Breaks down searches into monthly chunks to avoid IMAP response size limits
-- **Sequence-based chunking**: Alternative approach that fetches emails in small batches
-- **Error resilience**: Can continue even if individual chunks fail
-- **Progress tracking**: Shows detailed progress during large mailbox operations
-
-## Attachment Deduplication
-
-The tool implements efficient attachment storage:
-
-- **Content-based deduplication**: Uses SHA-256 hashing to identify identical attachments
-- **Storage efficiency**: Each unique attachment is stored only once
-- **Normalized schema**: Maintains the relationship between emails and attachments
-- **Statistics reporting**: Shows deduplication ratio and storage savings
+*   **Attachment Deduplication:**
+    When extracting attachments (`sync attachments` mode), SyncEmail calculates the SHA-256 hash of each attachment's content. The binary data of an attachment is stored only once in the `attachment_blobs` table, even if the same file was attached to multiple emails. The `email_attachments` table then links emails to these unique blobs. This saves significant disk space.
 
 ## Useful SQLite Queries
 
-### Top Email Senders by Count
+Here are some examples of SQL queries you can run directly against your SQLite database (e.g., using `sqlite3 mail.sqlite3` or a GUI tool). Many of these are also available through the `query` command.
 
-```sql
-SELECT msg_from, COUNT(*) as count 
-FROM emails 
-GROUP BY msg_from 
-ORDER BY count DESC 
-LIMIT 10;
-```
+*   **Top Senders by Count:**
+    ```sql
+    SELECT msg_from, COUNT(*) as count 
+    FROM emails 
+    GROUP BY msg_from 
+    ORDER BY count DESC 
+    LIMIT 20;
+    ```
 
-### Extract Email Addresses from Sender Field
+*   **Emails by Date Range:**
+    ```sql
+    SELECT subject, msg_from, msg_date FROM emails 
+    WHERE msg_date BETWEEN '2023-01-01' AND '2023-12-31' 
+    ORDER BY msg_date DESC;
+    ```
 
-To extract just the email address from within angle brackets (`<email@domain.com>`):
+*   **Count Emails per Mailbox:**
+    ```sql
+    SELECT mailbox, COUNT(*) as email_count 
+    FROM emails 
+    GROUP BY mailbox 
+    ORDER BY email_count DESC;
+    ```
 
-```sql
-CREATE VIEW email_senders AS 
-SELECT 
-    SUBSTR(msg_from, INSTR(msg_from, '<') + 1, INSTR(msg_from, '>') - INSTR(msg_from, '<') - 1) AS email_address, 
-    COUNT(*) as count 
-FROM emails 
-WHERE INSTR(msg_from, '<') > 0 AND INSTR(msg_from, '>') > INSTR(msg_from, '<') 
-GROUP BY email_address 
-ORDER BY count DESC;
-```
+*   **Find Large Emails with Attachments (using `full_emails` generated columns):**
+    ```sql
+    SELECT e.subject, f.message_size_kb, e.msg_date
+    FROM emails e
+    JOIN full_emails f ON e.uid = f.uid AND e.mailbox = f.mailbox
+    WHERE f.has_attachments = 1
+    ORDER BY f.message_size_kb DESC
+    LIMIT 20;
+    ```
 
-Then query the view:
+*   **Find Largest Attachments (using the `attachment_info` view):**
+    ```sql
+    SELECT filename, size / 1024 / 1024.0 AS size_mb, msg_date, subject
+    FROM attachment_info
+    ORDER BY size DESC
+    LIMIT 20;
+    ```
 
-```sql
-SELECT * FROM email_senders LIMIT 20;
-```
+*   **Find Emails with PDF Attachments:**
+    ```sql
+    SELECT DISTINCT e.subject, e.msg_from, e.msg_date, ai.filename
+    FROM attachment_info ai
+    JOIN emails e ON ai.uid = e.uid AND ai.mailbox = e.mailbox
+    WHERE LOWER(ai.filename) LIKE '%.pdf'
+    ORDER BY e.msg_date DESC;
+    ```
 
-### Extract Email Domains from Sender Field
-
-To extract just the domain portion of email addresses in the sender field:
-
-```sql
-CREATE VIEW domain_senders AS 
-SELECT 
-    SUBSTR(msg_from, INSTR(msg_from, '@') + 1, INSTR(msg_from, '>') - INSTR(msg_from, '@') - 1) AS domain, 
-    COUNT(*) as count 
-FROM emails 
-WHERE INSTR(msg_from, '@') > 0 AND INSTR(msg_from, '>') > INSTR(msg_from, '@') 
-GROUP BY domain 
-ORDER BY count DESC;
-```
-
-Query the view to see the top domains:
-
-```sql
-SELECT * FROM domain_senders LIMIT 20;
-```
-
-### Emails by Date Range
-
-```sql
-SELECT * FROM emails 
-WHERE msg_date BETWEEN '2023-01-01' AND '2023-12-31' 
-ORDER BY msg_date DESC;
-```
-
-### Count Emails by Mailbox
-
-```sql
-SELECT 
-    mailbox, 
-    COUNT(*) as email_count 
-FROM emails 
-GROUP BY mailbox 
-ORDER BY email_count DESC;
-```
-
-### New Queries Using Generated Columns
-
-#### Find Large Emails with Attachments
-
-```sql
-SELECT e.subject, f.message_size_kb, e.msg_date
-FROM emails e
-JOIN full_emails f ON e.uid = f.uid AND e.mailbox = f.mailbox
-WHERE f.has_attachments = 1
-ORDER BY f.message_size_kb DESC
-LIMIT 20;
-```
-
-#### Emails with Images
-
-```sql
-SELECT e.subject, e.msg_from, e.msg_date
-FROM emails e
-JOIN full_emails f ON e.uid = f.uid AND e.mailbox = f.mailbox
-WHERE f.has_images = 1
-ORDER BY e.msg_date DESC
-LIMIT 50;
-```
-
-#### Find Message Threads
-
-```sql
--- Find all emails in a thread using message_id and in_reply_to
-WITH RECURSIVE thread(uid, mailbox, message_id, level) AS (
-    -- Start with a specific message ID
-    SELECT uid, mailbox, message_id, 0
-    FROM full_emails
-    WHERE message_id = '<specific-message-id@example.com>'
-    
-    UNION ALL
-    
-    -- Find all replies
-    SELECT f.uid, f.mailbox, f.message_id, t.level + 1
-    FROM full_emails f
-    JOIN thread t ON f.in_reply_to = t.message_id
-)
-SELECT e.subject, e.msg_from, e.msg_date, t.level
-FROM thread t
-JOIN emails e ON t.uid = e.uid AND t.mailbox = e.mailbox
-ORDER BY e.msg_date;
-```
-
-### Queries Using the Attachment Tables
-
-#### Find Duplicate Attachments
-
-```sql
-SELECT sha256, COUNT(*) as occurrences
-FROM email_attachments
-GROUP BY sha256
-HAVING COUNT(*) > 1
-ORDER BY occurrences DESC;
-```
-
-#### Find Largest Attachments
-
-```sql
-SELECT e.subject, ea.filename, ab.size/1024/1024 as size_mb, e.msg_date
-FROM attachment_info ai
-JOIN emails e ON ai.uid = e.uid AND ai.mailbox = e.mailbox
-JOIN email_attachments ea ON ai.id = ea.id
-JOIN attachment_blobs ab ON ea.sha256 = ab.sha256
-ORDER BY ab.size DESC
-LIMIT 20;
-```
-
-#### Find Emails with PDF Attachments
-
-```sql
-SELECT e.subject, e.msg_from, e.msg_date, ea.filename
-FROM email_attachments ea
-JOIN emails e ON ea.uid = e.uid AND ea.mailbox = e.mailbox
-WHERE ea.filename LIKE '%.pdf'
-ORDER BY e.msg_date DESC;
-```
-
-#### Find Attachments by File Extension
-
-```sql
-SELECT 
-  LOWER(SUBSTR(filename, INSTR(filename, '.', -1) + 1)) as extension,
-  COUNT(*) as count,
-  SUM(ab.size)/1024/1024 as total_size_mb
-FROM email_attachments ea
-JOIN attachment_blobs ab ON ea.sha256 = ab.sha256
-WHERE INSTR(filename, '.') > 0
-GROUP BY extension
-ORDER BY count DESC;
-```
+*   **Attachment Types by Count and Size:**
+    ```sql
+    SELECT 
+      LOWER(SUBSTR(filename, INSTR(filename, '.') + 1)) as extension,
+      COUNT(*) as count,
+      SUM(size) / 1024 / 1024.0 as total_size_mb
+    FROM attachment_info
+    WHERE INSTR(filename, '.') > 0
+    GROUP BY extension
+    ORDER BY count DESC;
+    ```
 
 ## Troubleshooting
 
-### Running with uv
+*   **`ModuleNotFoundError`**: Ensure your virtual environment is active (`source .venv/bin/activate`) and all dependencies are installed (`uv pip install -r requirements.txt`). Run the script using `uv run main.py ...`.
+*   **OAuth2 Errors (`invalid_grant`, etc.)**:
+    *   Ensure your `creds.json` file is correctly configured and points to the credentials for a "Desktop app".
+    *   Verify the Gmail API is enabled in your Google Cloud Project.
+    *   If you recently changed your Google password or revoked access, delete `token.json` and re-authenticate.
+    *   Ensure your system clock is accurate.
+*   **Database Issues (`no such column`, `database locked`):**
+    *   `no such column`: The tool attempts to perform schema migrations. If errors persist, especially after an update, backing up and then deleting the database file to let SyncEmail recreate it might be a solution (data will need tobe re-synced).
+    *   `database is locked`: Ensure no other application or process is actively using the SQLite database file.
+*   **IMAP Issues (Connection timeouts, errors with specific mailboxes):**
+    *   Check your internet connection.
+    *   Gmail has rate limits. While SyncEmail tries to be respectful, very intensive operations on huge mailboxes might hit them. Try again later or sync smaller subsets of mailboxes if issues persist.
+    *   Some special mailboxes might have non-standard behavior.
 
-- **Virtual Environment Issues**: If you see `ModuleNotFoundError` for packages that should be installed, make sure to:
-  1. Verify the package is installed with `uv pip list`
-  2. Always use `uv run --active` to run the script to ensure it uses the active virtual environment
-  3. If packages are missing, reinstall them with `uv pip install -r requirements.txt`
+## How It Works (Simplified)
 
-- **Environment Conflicts**: If you see warnings about environment paths not matching, use the `--active` flag with uv run to explicitly use the active environment.
-
-### Database Issues
-
-- **Missing Columns Error**: If you see errors like `no such column: has_images`, run the tool again. It will automatically detect and fix the database schema.
-- **Database Locked**: If the database is locked, ensure no other process is using it and try again.
-- **Performance Issues**: For large databases, consider using the `--limit` parameter with queries to reduce result size.
-
-### OAuth2 Issues
-
-- **Authentication Errors**: Ensure your `creds.json` file is valid and you've enabled the Gmail API
-- **Token Expiration**: If your token expires, the tool will attempt to refresh it automatically. If that fails, delete `token.json` and run the tool again.
-
-### IMAP Issues
-
-- **Connection Timeout**: Check your internet connection or try again later
-- **Rate Limiting**: Gmail has rate limits - the tool applies small delays but might still hit limits with large mailboxes
-- **Large Mailbox Issues**: For problems with "[Gmail]/All Mail":
-  - The tool uses special date-based chunking for this mailbox
-  - If you encounter "Could not parse command" errors, try using a specific mailbox instead
-  - You can reduce chunk size by modifying the code if needed
-
-## How It Works
-
-1. The tool authenticates with Gmail using OAuth 2.0
-2. It fetches UIDs of all emails in the specified mailbox
-3. It determines which emails are new since the last sync
-4. It downloads just the header information for new emails
-5. Headers are parsed and stored in the SQLite database
-6. (Optional) Full email content can be downloaded in a second pass
-7. Progress is saved in checkpoints for resumable operation
-8. Attachments can be extracted and normalized with deduplication
-9. Analytics can be generated from the email and attachment data
+1.  **Authentication:** Connects to Gmail using OAuth 2.0 via the `imap_client` module.
+2.  **Command Parsing:** `main.py` parses command-line arguments and dispatches to the appropriate handler function.
+3.  **Synchronization (`sync` module):**
+    *   Fetches email UIDs from the specified mailbox.
+    *   Compares with UIDs in the local database and checkpoint files to determine new/changed emails.
+    *   For `headers` mode: Fetches only header information.
+    *   For `full` mode: Fetches the entire raw email.
+    *   For `attachments` mode: Parses raw emails from the DB, extracts attachments, calculates hashes, and stores them.
+    *   Data is saved to the SQLite database via the `db` module.
+    *   Progress is tracked by the `checkpoint` module.
+4.  **Querying (`queries` module):** Executes SQL queries against the database.
+5.  **Analytics (`analytics` module):** Runs aggregation queries and uses `termgraph` (if data is suitable) for visualization.
 
 ## License
 
-MIT
+This project is licensed under the MIT License. See the `LICENSE` file for details.

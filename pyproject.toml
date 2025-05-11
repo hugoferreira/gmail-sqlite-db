@@ -1,0 +1,7 @@
+[project]
+name = "syncemail"
+version = "0.1.0"
+description = "A Python tool for syncing and analyzing email data from Gmail using OAuth2 authentication, with support for full email content, attachments, and advanced querying capabilities."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
